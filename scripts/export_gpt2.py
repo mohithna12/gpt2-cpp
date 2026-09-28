@@ -13,6 +13,7 @@ Writes:
 """
 import argparse
 import os
+import shutil
 
 import gpt2bin
 
@@ -23,7 +24,8 @@ def main():
     ap.add_argument("--out", default="models")
     args = ap.parse_args()
 
-    from transformers import GPT2LMHeadModel, GPT2Tokenizer
+    from huggingface_hub import hf_hub_download
+    from transformers import GPT2LMHeadModel
 
     os.makedirs(args.out, exist_ok=True)
     model = GPT2LMHeadModel.from_pretrained(args.model)
@@ -44,8 +46,11 @@ def main():
     gpt2bin.write(path, config, tensors)
     print(f"wrote {path}  ({os.path.getsize(path) / 1e6:.1f} MB)  config={config}")
 
-    GPT2Tokenizer.from_pretrained(args.model).save_pretrained(args.out)
-    print(f"wrote tokenizer files to {args.out}/")
+    # Copy the original BPE files from the Hub. Tokenizer.save_pretrained() isn't used because
+    # transformers >= 5 only writes tokenizer.json, not vocab.json / merges.txt.
+    for fname in ("vocab.json", "merges.txt"):
+        shutil.copyfile(hf_hub_download(args.model, fname), os.path.join(args.out, fname))
+    print(f"wrote {args.out}/vocab.json and {args.out}/merges.txt")
 
 
 if __name__ == "__main__":

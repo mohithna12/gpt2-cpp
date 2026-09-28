@@ -23,7 +23,20 @@ target_link_libraries(gpt2 gpt2core)
 
 # Tests: generate a tiny random checkpoint with numpy, then load it from C++.
 enable_testing()
+# FindPython picks the newest interpreter on the system, which may lack numpy. Prefer the
+# project venv (or an activated one); override with -DPython3_EXECUTABLE=... if needed.
+if(NOT DEFINED Python3_EXECUTABLE AND EXISTS "${CMAKE_SOURCE_DIR}/.venv/bin/python")
+  set(Python3_EXECUTABLE "${CMAKE_SOURCE_DIR}/.venv/bin/python")
+endif()
+set(Python3_FIND_VIRTUALENV FIRST)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+execute_process(COMMAND ${Python3_EXECUTABLE} -c "import numpy"
+                RESULT_VARIABLE _numpy_rc OUTPUT_QUIET ERROR_QUIET)
+if(NOT _numpy_rc EQUAL 0)
+  message(FATAL_ERROR "numpy is not importable by ${Python3_EXECUTABLE}; tests need it to "
+                      "generate the tiny checkpoint. Create .venv (see CLAUDE.md) or pass "
+                      "-DPython3_EXECUTABLE=/path/to/python.")
+endif()
 add_executable(test_loader tests/test_loader.cpp)
 target_link_libraries(test_loader gpt2core)
 add_custom_command(

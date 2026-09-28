@@ -21,6 +21,13 @@ namespace {
 constexpr uint32_t kVersion = 1;
 constexpr size_t kAlign = 64;
 
+// 64-byte aligned allocation, released with std::free. posix_memalign rather than
+// std::aligned_alloc: the latter only exists on macOS 10.15+, the former everywhere POSIX.
+void* aligned_malloc(size_t bytes) {
+    void* p = nullptr;
+    return posix_memalign(&p, kAlign, bytes) == 0 ? p : nullptr;
+}
+
 [[noreturn]] void fail(const std::string& path, const std::string& msg) {
     throw std::runtime_error(path + ": " + msg);
 }
@@ -93,10 +100,10 @@ Model Model::load(const std::string& path) {
     f.seekg(0);
 
     Model m;
-    // Round up so aligned_alloc's size requirement holds; tensors stay 64-byte aligned
-    // because the file places each one at a 64-byte offset.
+    // Tensors stay 64-byte aligned because the file places each one at a 64-byte offset.
+    // Size is rounded up to a whole number of cache lines.
     m.buffer_bytes_ = (file_size + kAlign - 1) / kAlign * kAlign;
-    void* raw = std::aligned_alloc(kAlign, m.buffer_bytes_ ? m.buffer_bytes_ : kAlign);
+    void* raw = aligned_malloc(m.buffer_bytes_ ? m.buffer_bytes_ : kAlign);
     if (!raw) fail(path, "out of memory");
     m.buffer_ = std::shared_ptr<float>(static_cast<float*>(raw), [](float* q) { std::free(q); });
     auto* bytes = reinterpret_cast<unsigned char*>(raw);
