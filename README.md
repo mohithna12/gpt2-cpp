@@ -6,8 +6,8 @@ GPT-2 inference in C++17 with no ML-framework dependencies.
 
 - [x] Phase 1a: weight export, checkpoint format, `Tensor`, loader, `gpt2 inspect`
 - [x] Phase 1b: byte-level BPE tokenizer (must match HF token ids)
-- [ ] Phase 2: naive forward pass
-- [ ] Phase 3: differential tests against HF logits (1e-4, ~100 prompts)
+- [x] Phase 2: naive forward pass
+- [ ] Phase 3: differential tests against HF logits (2e-3 abs + argmax, ~100 prompts)
 - [ ] Phase 4: KV cache
 - [ ] Phase 5: blocked / SIMD GEMM
 - [ ] Phase 6: multithreading
@@ -32,10 +32,14 @@ python scripts/check_real_weights.py     # every tensor bit-identical to HF
 
 ./build/gpt2 encode models "Hello world"  # 15496 995
 ./build/gpt2 decode models 15496 995      # Hello world
+
+python scripts/make_logits_ref.py         # HF logits for the forward_hf test
+./build/gpt2 generate models "The meaning of life is" 20   # greedy
+./build/gpt2 bench models 64              # time one forward pass
 ```
 
-The tokenizer test (`ctest`) needs `models/vocab.json` and `models/merges.txt`; it is
-skipped if they're missing.
+The `tokenizer` and `forward_hf` tests need the exported files in `models/`; they are skipped
+if those are missing.
 
 Debug with sanitizers: `cmake -S . -B build-asan -DGPT2_SANITIZE=ON`.
 
@@ -48,14 +52,28 @@ scripts/make_tiny_checkpoint.py random 2-layer model + reference stats for tests
 scripts/check_real_weights.py   exported gpt2.bin vs HF state_dict, exact comparison
 scripts/gen_unicode_tables.py   probe HF's pre-tokenizer -> src/unicode_tables.h
 scripts/make_tokenizer_fixtures.py  HF token ids -> tests/tokenizer_cases.tsv
+scripts/make_logits_ref.py      HF logits (every position, 6 prompts) -> models/logits_ref.bin
 src/tensor.h                    non-owning float32 tensor view
 src/model.{h,cpp}               Config, Weights, Model::load
 src/tokenizer.{h,cpp}           byte-level BPE: pre-tokenizer, merges, encode/decode
 src/unicode_tables.h            generated letter/number/space code point ranges
-src/main.cpp                    CLI: inspect, encode, decode
+src/ops.{h,cpp}                 layernorm, matmul, GELU, causal attention (plain loops)
+src/forward.{h,cpp}             forward pass: tokens -> logits for every position
+src/main.cpp                    CLI: inspect, encode, decode, generate, bench
 tests/test_loader.cpp           loader vs reference stats, corrupt-file rejection
 tests/test_tokenizer.cpp        5098 HF-generated cases, invalid UTF-8 round trips, bad files
+tests/test_forward.cpp          tiny-model invariants (causality, determinism); logits vs HF
 ```
+
+## Correctness
+
+`forward_hf` compares logits at every position with HF float32: max |diff| must be ≤ 2e-3 and
+the argmax must match. The project originally targeted 1e-4, but that's below float32 noise for
+GPT-2: logits reach ~300, and HF's own float32 logits are up to 6.5e-4 from a float64 run.
+A C++ build accumulating in double lands within 3.4e-5 of float64, yet still 6.7e-4 from HF
+float32. Calibration with injected bugs: correct code 7.9e-4 worst; exact-erf instead of tanh
+GELU 7.5e-2 to 0.72; LayerNorm eps 1e-6 fails 5 of 6 prompts. Greedy generation matches HF's
+`generate(do_sample=False)` token for token.
 
 ## Checkpoint format
 
@@ -84,3 +102,9 @@ Apple M2 Pro, Release build, single thread.
 |---|---|---|---|
 | `gpt2 encode` (naive BPE, no cache) | 1.86 MB, 768,200 tokens | 0.70 s end to end | includes ~0.02 s vocab load; ids identical to HF |
 | HF fast tokenizer `encode` (reference) | same | 1.11 s | Python call, for scale |
+| Forward, naive loops (phase 2) | T=1 | 56.7 ms | 17.6 tok/s |
+| Forward, naive loops (phase 2) | T=64 | 3186 ms | 20.1 tok/s, ~5 GFLOP/s |
+| Forward, naive loops (phase 2) | T=256 | 12869 ms | 19.9 tok/s |
+| Greedy generate, no KV cache (phase 2) | 5 + 20 tokens | 14.6 s | 1.37 tok/s |
+
+Forward numbers are `gpt2 bench models T`, best of 3.
