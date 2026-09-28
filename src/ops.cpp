@@ -60,33 +60,35 @@ void add_inplace(float* out, const float* x, int64_t n) {
     for (int64_t i = 0; i < n; ++i) out[i] += x[i];
 }
 
-void attention(float* out, const float* qkv, int64_t T, int64_t C, int64_t n_head) {
+void attention(float* out, const float* qkv, const float* k, const float* v, int64_t T,
+               int64_t pos0, int64_t C, int64_t n_head) {
     const int64_t hd = C / n_head;
     const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
-    std::vector<float> scores(T);
+    std::vector<float> scores(pos0 + T);
     for (int64_t h = 0; h < n_head; ++h) {
         for (int64_t t = 0; t < T; ++t) {
             const float* q = qkv + t * 3 * C + h * hd;
-            // Scores against positions 0..t only (causal), then a stable softmax.
+            const int64_t n = pos0 + t + 1;  // causal: positions 0..pos0+t
+            // Scores, then a stable softmax.
             float mx = -INFINITY;
-            for (int64_t s = 0; s <= t; ++s) {
-                const float* k = qkv + s * 3 * C + C + h * hd;
+            for (int64_t s = 0; s < n; ++s) {
+                const float* ks = k + s * C + h * hd;
                 float dot = 0;
-                for (int64_t i = 0; i < hd; ++i) dot += q[i] * k[i];
+                for (int64_t i = 0; i < hd; ++i) dot += q[i] * ks[i];
                 scores[s] = dot * scale;
                 if (scores[s] > mx) mx = scores[s];
             }
             float sum = 0;
-            for (int64_t s = 0; s <= t; ++s) {
+            for (int64_t s = 0; s < n; ++s) {
                 scores[s] = std::exp(scores[s] - mx);
                 sum += scores[s];
             }
             float* o = out + t * C + h * hd;
             for (int64_t i = 0; i < hd; ++i) o[i] = 0;
-            for (int64_t s = 0; s <= t; ++s) {
+            for (int64_t s = 0; s < n; ++s) {
                 const float p = scores[s] / sum;
-                const float* v = qkv + s * 3 * C + 2 * C + h * hd;
-                for (int64_t i = 0; i < hd; ++i) o[i] += p * v[i];
+                const float* vs = v + s * C + h * hd;
+                for (int64_t i = 0; i < hd; ++i) o[i] += p * vs[i];
             }
         }
     }

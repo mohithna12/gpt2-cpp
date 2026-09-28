@@ -25,8 +25,11 @@ void gelu(float* x, int64_t n);
 // out[t] += x[t] over n elements.
 void add_inplace(float* out, const float* x, int64_t n);
 
-// Causal multi-head self-attention. qkv is [T, 3C] (q | k | v, each split into n_head
-// heads of C / n_head columns); out is [T, C] with heads concatenated.
-void attention(float* out, const float* qkv, int64_t T, int64_t C, int64_t n_head);
+// Causal multi-head self-attention for T new queries at absolute positions pos0..pos0+T-1.
+// Queries come from qkv [T, 3C] (the q third; heads are C / n_head column slices). Keys and
+// values come from the cache, k/v [pos0 + T, C], which must already hold the new positions.
+// out is [T, C] with heads concatenated.
+void attention(float* out, const float* qkv, const float* k, const float* v, int64_t T,
+               int64_t pos0, int64_t C, int64_t n_head);
 
 }  // namespace gpt2::ops

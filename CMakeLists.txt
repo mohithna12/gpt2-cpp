@@ -58,7 +58,8 @@ add_test(NAME tokenizer
 set_tests_properties(tokenizer PROPERTIES SKIP_RETURN_CODE 77)
 
 # Forward pass: invariants on the tiny checkpoint, then logits vs HF on the real model.
-# forward_hf: 6 prompts, every row (models/logits_ref.bin). diff_hf: the Phase 3 differential
+# forward_hf: 6 prompts, every row (models/logits_ref.bin); forward_hf_decode: the same, fed one
+# token at a time through the KV cache. diff_hf: the Phase 3 differential
 # test, 94 prompts up to n_ctx (models/diff_ref.bin); slow until later phases speed up forward,
 # so it's labelled: `ctest -LE slow` skips it. Both need scripts/make_logits_ref.py output and
 # are skipped (exit 77) without it.
@@ -70,9 +71,13 @@ add_test(NAME forward_hf
          COMMAND test_forward hf ${CMAKE_SOURCE_DIR}/models/gpt2.bin
                  ${CMAKE_SOURCE_DIR}/models/logits_ref.bin
          WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+add_test(NAME forward_hf_decode
+         COMMAND test_forward decode ${CMAKE_SOURCE_DIR}/models/gpt2.bin
+                 ${CMAKE_SOURCE_DIR}/models/logits_ref.bin
+         WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME diff_hf
          COMMAND test_forward hf ${CMAKE_SOURCE_DIR}/models/gpt2.bin
                  ${CMAKE_SOURCE_DIR}/models/diff_ref.bin
          WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-set_tests_properties(forward_hf diff_hf PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(forward_hf forward_hf_decode diff_hf PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(diff_hf PROPERTIES LABELS slow TIMEOUT 3600)

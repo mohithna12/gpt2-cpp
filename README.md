@@ -8,7 +8,7 @@ GPT-2 inference in C++17 with no ML-framework dependencies.
 - [x] Phase 1b: byte-level BPE tokenizer (must match HF token ids)
 - [x] Phase 2: naive forward pass
 - [x] Phase 3: differential tests against HF (94 prompts up to n_ctx; log-probs within 2e-3, argmax equal)
-- [ ] Phase 4: KV cache
+- [x] Phase 4: KV cache
 - [ ] Phase 5: blocked / SIMD GEMM
 - [ ] Phase 6: multithreading
 - [ ] Phase 7: CLI sampling, benchmarks, results table
@@ -62,11 +62,12 @@ src/model.{h,cpp}               Config, Weights, Model::load
 src/tokenizer.{h,cpp}           byte-level BPE: pre-tokenizer, merges, encode/decode
 src/unicode_tables.h            generated letter/number/space code point ranges
 src/ops.{h,cpp}                 layernorm, matmul, GELU, causal attention (plain loops)
-src/forward.{h,cpp}             forward pass: tokens -> logits for every position
+src/forward.{h,cpp}             forward pass with KV cache: new tokens -> logits
 src/main.cpp                    CLI: inspect, encode, decode, generate, bench
 tests/test_loader.cpp           loader vs reference stats, corrupt-file rejection
 tests/test_tokenizer.cpp        5098 HF-generated cases, invalid UTF-8 round trips, bad files
-tests/test_forward.cpp          tiny-model invariants (causality, determinism); vs HF
+tests/test_forward.cpp          tiny-model invariants (causality, KV cache = full pass bit for
+                                bit); vs HF, both full prefill and token-by-token decode
 tests/diff_prompts.jsonl        differential-test prompt set (committed)
 ```
 
@@ -75,7 +76,8 @@ tests/diff_prompts.jsonl        differential-test prompt set (committed)
 The differential test compares **log-probabilities** (log-softmax of the logits) with HF float32:
 max |diff| ≤ 2e-3, and the argmax must equal HF's at every position. Two ctest entries use it:
 
-- `forward_hf`: 6 prompts, every position, full vocabulary.
+- `forward_hf`: 6 prompts, every position, full vocabulary. `forward_hf_decode` runs the same
+  prompts one token at a time through the KV cache.
 - `diff_hf`: 94 prompts, 10,070 tokens (`tests/diff_prompts.jsonl`): short text, code,
   multilingual/emoji, repetition, random token ids, prose, and long contexts of 512, 768 and
   1024 tokens, including a full-context prompt with `<|endoftext|>` in the middle. It checks
@@ -127,5 +129,13 @@ Apple M2 Pro, Release build, single thread.
 | Forward, naive loops (phase 2) | T=64 | 3186 ms | 20.1 tok/s, ~5 GFLOP/s |
 | Forward, naive loops (phase 2) | T=256 | 12869 ms | 19.9 tok/s |
 | Greedy generate, no KV cache (phase 2) | 5 + 20 tokens | 14.6 s | 1.37 tok/s |
+| Greedy generate, no KV cache (phase 3 code) | 64 + 20 tokens | 74.9 s | 0.27 tok/s |
+| Greedy generate, KV cache (phase 4) | 5 + 20 tokens | 0.23 s prefill + 1.26 s | 15.0 tok/s |
+| Greedy generate, KV cache (phase 4) | 64 + 20 tokens | 0.74 s prefill + 1.16 s | 16.4 tok/s |
+| Decode step, KV cache (phase 4) | after T=1 / 64 / 256 / 900 | 56.5 / 59.5 / 61.6 / 72.7 ms | 17.7 → 13.8 tok/s |
+| Prefill, all logits (phase 4) | T=64 / 256 | 3233 / 13257 ms | unchanged from phase 2 |
 
-Forward numbers are `gpt2 bench models T`, best of 3.
+Prefill and decode numbers are `gpt2 bench models T`, best of 3. Generate numbers are from
+`gpt2 generate`. Prefill with all logits is dominated by the LM head: `matmul_transposed` is a
+dot-product reduction the compiler won't vectorize without fast-math. With only the last row's
+logits, a 64-token prefill takes 0.74 s instead of 3.2 s. That's the first target for phase 5.

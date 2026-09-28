@@ -3,7 +3,8 @@
 //   gpt2 encode <models dir> <text>   print token ids ("-" reads the text from stdin)
 //   gpt2 decode <models dir> <id>...  print the text for token ids
 //   gpt2 generate <models dir> <prompt> [n]   greedy continuation, n tokens (default 20)
-//   gpt2 bench <models dir> [T]       time one forward pass over T tokens (default 64)
+//   gpt2 bench <models dir> [T]       time prefill of T tokens (default 64), then decoding
+//                                     32 more through the KV cache
 
 #include <algorithm>
 #include <chrono>
@@ -51,10 +52,8 @@ static double ms_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
-// Index of the largest logit in the last row.
-static int argmax_last(const std::vector<float>& logits, size_t T, size_t V) {
-    const float* row = logits.data() + (T - 1) * V;
-    return static_cast<int>(std::max_element(row, row + V) - row);
+static int argmax(const std::vector<float>& row) {
+    return static_cast<int>(std::max_element(row.begin(), row.end()) - row.begin());
 }
 
 int main(int argc, char** argv) {
@@ -99,35 +98,55 @@ int main(int argc, char** argv) {
             const gpt2::Model m = gpt2::Model::load(dir + "/gpt2.bin");
             std::vector<int> ids = tok.encode(argv[3]);
             if (ids.empty()) ids.push_back(gpt2::Tokenizer::kEndOfText);
-            const size_t V = m.config().vocab_size, n_prompt = ids.size();
+            const size_t n_prompt = ids.size();
             std::fwrite(argv[3], 1, std::strlen(argv[3]), stdout);
-            const auto t0 = std::chrono::steady_clock::now();
-            for (int i = 0; i < n && static_cast<int>(ids.size()) < m.config().n_ctx; ++i) {
-                // No KV cache yet: the whole sequence is recomputed for every new token.
-                ids.push_back(argmax_last(gpt2::forward(m, ids), ids.size(), V));
-                const std::string piece = tok.decode({ids.back()});
+            gpt2::KVCache cache(m.config());
+            // Prefill the prompt once, then feed back one token at a time through the cache.
+            auto t0 = std::chrono::steady_clock::now();
+            int next = argmax(gpt2::forward(m, cache, ids, gpt2::Logits::Last));
+            const double prefill_ms = ms_since(t0);
+            t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < n; ++i) {
+                ids.push_back(next);
+                const std::string piece = tok.decode({next});
                 std::fwrite(piece.data(), 1, piece.size(), stdout);
                 std::fflush(stdout);
+                if (i + 1 == n || cache.pos == m.config().n_ctx) break;
+                next = argmax(gpt2::forward(m, cache, {next}, gpt2::Logits::Last));
             }
-            const double ms = ms_since(t0);
+            const double decode_ms = ms_since(t0);
             const size_t made = ids.size() - n_prompt;
             std::printf("\n");
-            std::fprintf(stderr, "[%zu prompt + %zu generated tokens, %.0f ms, %.2f tok/s]\n",
-                         n_prompt, made, ms, made * 1000.0 / ms);
+            std::fprintf(stderr,
+                         "[prefill %zu tokens %.0f ms; %zu generated tokens %.0f ms, %.2f tok/s]\n",
+                         n_prompt, prefill_ms, made, decode_ms,
+                         made > 1 ? (made - 1) * 1000.0 / decode_ms : 0.0);
         } else if (cmd == "bench" && (argc == 3 || argc == 4)) {
             const std::string dir = argv[2];
             const gpt2::Model m = gpt2::Model::load(dir + "/gpt2.bin");
             const int T = argc == 4 ? parse_count(argv[3], "sequence length") : 64;
+            constexpr int kDecode = 32;
+            if (T + kDecode > m.config().n_ctx)
+                throw std::runtime_error("bench: T + " + std::to_string(kDecode) + " exceeds n_ctx");
             std::vector<int> ids(T);
             for (int t = 0; t < T; ++t) ids[t] = (t * 7919 + 13) % m.config().vocab_size;
-            double best = 1e300;
+            // Best of 3: prefill with logits for every position (comparable with earlier
+            // phases), then kDecode single-token steps through the cache.
+            double prefill = 1e300, decode = 1e300;
             for (int rep = 0; rep < 3; ++rep) {
-                const auto t0 = std::chrono::steady_clock::now();
-                const std::vector<float> logits = gpt2::forward(m, ids);
-                best = std::min(best, ms_since(t0));
+                gpt2::KVCache cache(m.config());
+                auto t0 = std::chrono::steady_clock::now();
+                int next = argmax(gpt2::forward(m, cache, ids, gpt2::Logits::All));
+                prefill = std::min(prefill, ms_since(t0));
+                t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < kDecode; ++i)
+                    next = argmax(gpt2::forward(m, cache, {next}, gpt2::Logits::Last));
+                decode = std::min(decode, ms_since(t0));
             }
-            std::printf("forward T=%d: best of 3 = %.1f ms (%.1f tok/s)\n", T, best,
-                        T * 1000.0 / best);
+            std::printf("prefill T=%d (all logits): %.1f ms (%.1f tok/s)\n", T, prefill,
+                        T * 1000.0 / prefill);
+            std::printf("decode %d tokens after T=%d: %.1f ms/token (%.1f tok/s)\n", kDecode, T,
+                        decode / kDecode, kDecode * 1000.0 / decode);
         } else {
             return usage(argv[0]);
         }

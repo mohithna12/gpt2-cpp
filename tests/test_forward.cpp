@@ -2,7 +2,8 @@
 //
 //   test_forward tiny <tiny.bin>
 //       Invariants on the random tiny checkpoint (no download): causality (a prefix's logits
-//       don't depend on later tokens), determinism, finite outputs, input validation.
+//       don't depend on later tokens), determinism, finite outputs, input validation, and the
+//       KV cache: token-by-token and chunked decoding reproduce the full pass bit for bit.
 //   test_forward hf <gpt2.bin> <ref.bin>
 //       Differential test vs HF float32, using a reference from scripts/make_logits_ref.py
 //       (format v3). Compares log-probabilities (log-softmax of the logits), max abs diff
@@ -10,6 +11,9 @@
 //       every position. The argmax must match HF at every position. Exits 77 (skipped) if
 //       either file is missing. ctest runs it twice: forward_hf (6 prompts, every row) and
 //       diff_hf (tests/diff_prompts.jsonl: 94 prompts up to n_ctx, sampled rows; "slow").
+//   test_forward decode <gpt2.bin> <ref.bin>
+//       Same comparison, but tokens are fed one at a time through the KV cache (the generation
+//       path). ctest runs it on the forward_hf prompts as forward_hf_decode.
 //
 // Why log-probs at 2e-3 (the project first targeted raw logits within 1e-4): GPT-2 logits reach
 // ~300, and float32 logits, HF's own included, carry rare whole-row shifts of up to ~7e-3 vs a
@@ -63,6 +67,53 @@ static void test_tiny(const std::string& path) {
               "prefix of length %zu gives different logits", k);
     }
 
+    // KV cache: feeding the sequence in pieces must reproduce the full pass bit for bit.
+    const auto same_rows = [&](const std::vector<float>& got, size_t first_row) {
+        return std::memcmp(got.data(), full.data() + first_row * V, got.size() * sizeof(float)) == 0;
+    };
+    for (const std::vector<size_t>& chunks :
+         {std::vector<size_t>(tokens.size(), 1), std::vector<size_t>{3, 1, 5, 20, 2, 33}}) {
+        gpt2::KVCache cache(m.config());
+        size_t at = 0;
+        for (size_t n : chunks) {
+            const std::vector<int> piece(tokens.begin() + at, tokens.begin() + at + n);
+            CHECK(same_rows(gpt2::forward(m, cache, piece), at),
+                  "chunk [%zu, %zu) differs from the full pass", at, at + n);
+            at += n;
+        }
+        CHECK(at == tokens.size() && cache.pos == static_cast<int64_t>(at), "chunks/cache pos");
+    }
+    {
+        gpt2::KVCache cache(m.config());
+        const std::vector<int> head(tokens.begin(), tokens.begin() + 10);
+        const std::vector<float> last = gpt2::forward(m, cache, head, gpt2::Logits::Last);
+        CHECK(last.size() == size_t(V) && same_rows(last, 9), "Logits::Last != last row of All");
+
+        // Overflowing n_ctx throws and leaves the cache usable and unchanged.
+        bool threw = false;
+        try {
+            gpt2::forward(m, cache, std::vector<int>(m.config().n_ctx, 0));
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        CHECK(threw && cache.pos == 10, "overflow: threw=%d pos=%lld", threw, (long long)cache.pos);
+        CHECK(same_rows(gpt2::forward(m, cache, {tokens[10]}), 10), "cache unusable after a throw");
+
+        cache.clear();
+        CHECK(same_rows(gpt2::forward(m, cache, head), 0), "clear() does not reset the cache");
+
+        gpt2::Config other = m.config();
+        other.n_ctx /= 2;
+        gpt2::KVCache wrong(other);
+        threw = false;
+        try {
+            gpt2::forward(m, wrong, head);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        CHECK(threw, "forward accepted a cache made for a different config");
+    }
+
     const auto rejects = [&](const char* label, const std::vector<int>& t) {
         bool threw = false;
         try {
@@ -109,7 +160,7 @@ static void log_softmax(const float* x, size_t n, std::vector<double>& out) {
     for (size_t j = 0; j < n; ++j) out[j] = double(x[j]) - lse;
 }
 
-static int test_hf(const std::string& model_path, const std::string& ref_path) {
+static int test_hf(const std::string& model_path, const std::string& ref_path, bool decode) {
     Reader r{std::ifstream(ref_path, std::ios::binary), ref_path};
     if (!r.f || !std::ifstream(model_path)) {
         std::printf("SKIP: need %s and %s (scripts/export_gpt2.py, scripts/make_logits_ref.py)\n",
@@ -141,7 +192,17 @@ static int test_hf(const std::string& model_path, const std::string& ref_path) {
         const std::vector<float> want = r.vec<float>(rows.size() * size_t(V));
 
         const auto t0 = std::chrono::steady_clock::now();
-        const std::vector<float> got = gpt2::forward(m, ids);
+        std::vector<float> got;
+        if (decode) {  // one token at a time through the KV cache
+            gpt2::KVCache cache(m.config());
+            got.reserve(size_t(T) * V);
+            for (int id : ids) {
+                const std::vector<float> row = gpt2::forward(m, cache, {id});
+                got.insert(got.end(), row.begin(), row.end());
+            }
+        } else {
+            got = gpt2::forward(m, ids);
+        }
         const double ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
@@ -194,14 +255,15 @@ static int test_hf(const std::string& model_path, const std::string& ref_path) {
 
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "";
-    if (!((mode == "tiny" && argc == 3) || (mode == "hf" && argc == 4))) {
-        std::fprintf(stderr, "usage: %s tiny <tiny.bin> | hf <gpt2.bin> <ref.bin>\n", argv[0]);
+    if (!((mode == "tiny" && argc == 3) || ((mode == "hf" || mode == "decode") && argc == 4))) {
+        std::fprintf(stderr, "usage: %s tiny <tiny.bin> | {hf|decode} <gpt2.bin> <ref.bin>\n",
+                     argv[0]);
         return 2;
     }
     try {
         if (mode == "tiny") {
             test_tiny(argv[2]);
-        } else if (test_hf(argv[2], argv[3]) == 77) {
+        } else if (test_hf(argv[2], argv[3], mode == "decode") == 77) {
             return 77;
         }
     } catch (const std::exception& e) {

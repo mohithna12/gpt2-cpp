@@ -30,7 +30,7 @@ python scripts/make_logits_ref.py --prompts tests/diff_prompts.jsonl --rows samp
     --out models/diff_ref.bin                             # diff_hf reference
 ./build/gpt2 encode models "text"   |   ./build/gpt2 decode models 15496 995
 ./build/gpt2 generate models "prompt" 20                  # greedy
-./build/gpt2 bench models 64                              # forward timing
+./build/gpt2 bench models 64                              # prefill T=64 + 32 decode steps
 ```
 
 `loader` and `forward_tiny` use a tiny random checkpoint (`scripts/make_tiny_checkpoint.py`).
@@ -49,6 +49,9 @@ python scripts/make_logits_ref.py --prompts tests/diff_prompts.jsonl --rows samp
   allocates with `posix_memalign` (not `std::aligned_alloc`, which needs macOS 10.15+).
 - Tensor order/shapes are defined twice and must match: `expected_shapes()` in
   `scripts/gpt2bin.py` and `expected_tensors()` in `src/model.cpp`.
+- KV-cache decoding must equal the full pass bit for bit (`forward_tiny`). If a later
+  optimization makes T=1 and T>1 take different arithmetic paths, that test needs a tolerance.
+  Ask before changing it.
 - Tokenizer ground truth is HF's Rust tokenizer, not Python `unicodedata`.
   `src/unicode_tables.h` and `tests/tokenizer_cases.tsv` are generated and committed; regenerate
   with `scripts/gen_unicode_tables.py` / `scripts/make_tokenizer_fixtures.py`, never hand-edit.
@@ -74,7 +77,8 @@ asking. If it gets tight, report the numbers. The calibration table is in the RE
 - [x] 1b: byte-level BPE tokenizer (must match HF token ids)
 - [x] 2: naive forward pass (`src/ops.cpp`, `src/forward.cpp`)
 - [x] 3: differential tests vs HF (94 prompts to n_ctx, log-probs 2e-3, argmax)
-- [ ] **4: KV cache: CURRENT**
-- [ ] 5: blocked / SIMD GEMM (NEON on this machine)
+- [x] 4: KV cache (`KVCache`, `forward(m, cache, tokens, Logits::All|Last)`)
+- [ ] **5: blocked / SIMD GEMM (NEON on this machine): CURRENT.** Start with the LM head
+  (`matmul_transposed`), which dominates all-logits prefill (see README benchmarks).
 - [ ] 6: multithreading
 - [ ] 7: CLI sampling, benchmarks, results table
