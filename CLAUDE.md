@@ -25,9 +25,11 @@ cmake -S . -B build-asan -DGPT2_SANITIZE=ON && cmake --build build-asan -j   # A
 python scripts/export_gpt2.py --model gpt2 --out models   # gpt2.bin, vocab.json, merges.txt
 ./build/gpt2 inspect models/gpt2.bin                      # params: 124439808
 python scripts/check_real_weights.py                      # gpt2.bin vs HF, bit-exact
+./build/gpt2 encode models "text"   |   ./build/gpt2 decode models 15496 995
 ```
 
-Ctest uses a tiny random checkpoint (`scripts/make_tiny_checkpoint.py`), so it needs no download.
+The loader test uses a tiny random checkpoint (`scripts/make_tiny_checkpoint.py`). The tokenizer
+test needs `models/vocab.json` + `merges.txt` and is skipped (exit 77) without them.
 `models/`, `build*/` and `.venv/` are gitignored.
 
 ## Conventions
@@ -40,6 +42,9 @@ Ctest uses a tiny random checkpoint (`scripts/make_tiny_checkpoint.py`), so it n
   allocates with `posix_memalign` (not `std::aligned_alloc`, which needs macOS 10.15+).
 - Tensor order/shapes are defined twice and must match: `expected_shapes()` in
   `scripts/gpt2bin.py` and `expected_tensors()` in `src/model.cpp`.
+- Tokenizer ground truth is HF's Rust tokenizer, not Python `unicodedata`.
+  `src/unicode_tables.h` and `tests/tokenizer_cases.tsv` are generated and committed; regenerate
+  with `scripts/gen_unicode_tables.py` / `scripts/make_tokenizer_fixtures.py`, never hand-edit.
 
 ## The rule for optimizations
 
@@ -49,8 +54,8 @@ and (2) be benchmarked before and after. Record the numbers in the README.
 ## Roadmap
 
 - [x] 1a: weight export, checkpoint format, `Tensor`, loader, `gpt2 inspect`
-- [ ] **1b: byte-level BPE tokenizer (must match HF token ids): CURRENT**
-- [ ] 2: naive forward pass
+- [x] 1b: byte-level BPE tokenizer (must match HF token ids)
+- [ ] **2: naive forward pass: CURRENT**
 - [ ] 3: differential tests against HF logits (1e-4, ~100 prompts)
 - [ ] 4: KV cache
 - [ ] 5: blocked / SIMD GEMM (NEON on this machine)

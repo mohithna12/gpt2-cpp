@@ -15,7 +15,7 @@ if(GPT2_SANITIZE)
   add_link_options(-fsanitize=address,undefined)
 endif()
 
-add_library(gpt2core src/model.cpp)
+add_library(gpt2core src/model.cpp src/tokenizer.cpp)
 target_include_directories(gpt2core PUBLIC src)
 
 add_executable(gpt2 src/main.cpp)
@@ -47,3 +47,12 @@ add_custom_command(
 add_custom_target(tiny_checkpoint ALL DEPENDS ${CMAKE_BINARY_DIR}/tiny.bin)
 add_test(NAME loader COMMAND test_loader ${CMAKE_BINARY_DIR}/tiny.bin
          WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+# Tokenizer vs HF ids. Needs models/vocab.json + merges.txt from scripts/export_gpt2.py;
+# skipped (exit 77) when they're absent.
+add_executable(test_tokenizer tests/test_tokenizer.cpp)
+target_link_libraries(test_tokenizer gpt2core)
+add_test(NAME tokenizer
+         COMMAND test_tokenizer ${CMAKE_SOURCE_DIR}/models ${CMAKE_SOURCE_DIR}/tests/tokenizer_cases.tsv
+         WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(tokenizer PROPERTIES SKIP_RETURN_CODE 77)
