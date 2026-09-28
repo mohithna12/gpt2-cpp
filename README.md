@@ -7,7 +7,7 @@ GPT-2 inference in C++17 with no ML-framework dependencies.
 - [x] Phase 1a: weight export, checkpoint format, `Tensor`, loader, `gpt2 inspect`
 - [x] Phase 1b: byte-level BPE tokenizer (must match HF token ids)
 - [x] Phase 2: naive forward pass
-- [ ] Phase 3: differential tests against HF logits (2e-3 abs + argmax, ~100 prompts)
+- [x] Phase 3: differential tests against HF (94 prompts up to n_ctx; log-probs within 2e-3, argmax equal)
 - [ ] Phase 4: KV cache
 - [ ] Phase 5: blocked / SIMD GEMM
 - [ ] Phase 6: multithreading
@@ -33,13 +33,16 @@ python scripts/check_real_weights.py     # every tensor bit-identical to HF
 ./build/gpt2 encode models "Hello world"  # 15496 995
 ./build/gpt2 decode models 15496 995      # Hello world
 
-python scripts/make_logits_ref.py         # HF logits for the forward_hf test
+python scripts/make_logits_ref.py         # HF reference for forward_hf (6 prompts, fast)
+python scripts/make_logits_ref.py --prompts tests/diff_prompts.jsonl --rows sampled \
+    --out models/diff_ref.bin             # HF reference for diff_hf (94 prompts, ~9 min now)
 ./build/gpt2 generate models "The meaning of life is" 20   # greedy
 ./build/gpt2 bench models 64              # time one forward pass
 ```
 
-The `tokenizer` and `forward_hf` tests need the exported files in `models/`; they are skipped
-if those are missing.
+The `tokenizer`, `forward_hf` and `diff_hf` tests need the generated files in `models/`; they
+are skipped if those are missing. `diff_hf` is labelled `slow`: `ctest -LE slow` skips it (do
+that under ASan, where it would take hours at current speed).
 
 Debug with sanitizers: `cmake -S . -B build-asan -DGPT2_SANITIZE=ON`.
 
@@ -52,7 +55,8 @@ scripts/make_tiny_checkpoint.py random 2-layer model + reference stats for tests
 scripts/check_real_weights.py   exported gpt2.bin vs HF state_dict, exact comparison
 scripts/gen_unicode_tables.py   probe HF's pre-tokenizer -> src/unicode_tables.h
 scripts/make_tokenizer_fixtures.py  HF token ids -> tests/tokenizer_cases.tsv
-scripts/make_logits_ref.py      HF logits (every position, 6 prompts) -> models/logits_ref.bin
+scripts/make_diff_prompts.py    builds tests/diff_prompts.jsonl (94 prompts, token ids)
+scripts/make_logits_ref.py      HF log-probs -> models/logits_ref.bin, models/diff_ref.bin
 src/tensor.h                    non-owning float32 tensor view
 src/model.{h,cpp}               Config, Weights, Model::load
 src/tokenizer.{h,cpp}           byte-level BPE: pre-tokenizer, merges, encode/decode
@@ -62,28 +66,45 @@ src/forward.{h,cpp}             forward pass: tokens -> logits for every positio
 src/main.cpp                    CLI: inspect, encode, decode, generate, bench
 tests/test_loader.cpp           loader vs reference stats, corrupt-file rejection
 tests/test_tokenizer.cpp        5098 HF-generated cases, invalid UTF-8 round trips, bad files
-tests/test_forward.cpp          tiny-model invariants (causality, determinism); logits vs HF
+tests/test_forward.cpp          tiny-model invariants (causality, determinism); vs HF
+tests/diff_prompts.jsonl        differential-test prompt set (committed)
 ```
 
 ## Correctness
 
-`forward_hf` compares logits at every position with HF float32: max |diff| must be ≤ 2e-3 and
-the argmax must match. The project originally targeted 1e-4, but that's below float32 noise for
-GPT-2: logits reach ~300, and HF's own float32 logits are up to 6.5e-4 from a float64 run.
-A C++ build accumulating in double lands within 3.4e-5 of float64, yet still 6.7e-4 from HF
-float32. Calibration with injected bugs: correct code 7.9e-4 worst; exact-erf instead of tanh
-GELU 7.5e-2 to 0.72; LayerNorm eps 1e-6 fails 5 of 6 prompts. Greedy generation matches HF's
-`generate(do_sample=False)` token for token.
+The differential test compares **log-probabilities** (log-softmax of the logits) with HF float32:
+max |diff| ≤ 2e-3, and the argmax must equal HF's at every position. Two ctest entries use it:
 
-## Checkpoint format
+- `forward_hf`: 6 prompts, every position, full vocabulary.
+- `diff_hf`: 94 prompts, 10,070 tokens (`tests/diff_prompts.jsonl`): short text, code,
+  multilingual/emoji, repetition, random token ids, prose, and long contexts of 512, 768 and
+  1024 tokens, including a full-context prompt with `<|endoftext|>` in the middle. It checks
+  argmax and HF's top-20 log-probs at every position, and the full vocabulary at 961 sampled
+  positions.
 
-Little-endian. Header: `"GPT2"`, version, n_layer, n_head, n_embd, n_ctx, vocab_size,
-n_tensors, then one metadata record per tensor (name, dims, u64 data offset). Tensor data
-is float32 and each tensor starts on a 64-byte boundary, which suits SIMD loads later.
-Tensors appear in a fixed order and the loader checks every name and shape against the config.
+**Why log-probs within 2e-3 and not raw logits within 1e-4 (the original target):** GPT-2 logits
+reach ~300. Float32 logits, HF's own included, carry rare whole-row shifts vs a float64 run: up
+to 6.8e-3 for HF on a 512-token prompt, and 8e-3 between C++ and HF on 4 of 200 rows of a prose
+prompt. Softmax cancels a row shift, so sampling and perplexity never see it. Log-probs are
+stable: HF float32 stays within ~9e-4 of float64 at every position, flat with length.
 
-Linear weights keep HF's Conv1D layout `[in, out]`, so `y = x @ W + b`. The LM head is tied
-to `wte`, so it isn't stored separately.
+| Measurement (all positions, full vocabulary) | Worst |
+|---|---|
+| C++ vs HF float32, log-probs, worst prompts incl. 1024 tokens | 7.4e-4 |
+| HF float32 vs float64, log-probs | 9.7e-4 |
+| `diff_hf` as checked (top-20 everywhere + sampled full rows) | 2.8e-4 |
+| Argmax mismatches, 10,070 positions | 0 |
+
+Calibration with injected bugs (a bug counts as caught if any prompt fails):
+
+| Injected bug | forward_hf (6 prompts) | diff_hf (94 prompts) |
+|---|---|---|
+| Exact-erf GELU instead of tanh | 6/6 fail, 12–99× tolerance | |
+| LayerNorm eps 1e-4 | 5/6 fail, up to 35× | |
+| Attention scale ×1.001 | 5/6 fail, up to 25× | |
+| LayerNorm eps 1e-6 | 3/6 fail, up to 3.5× | 42/94 fail, up to 14× |
+
+Greedy generation matches HF's `generate(do_sample=False)` token for token.
 
 ## Tokenizer
 

@@ -1,16 +1,20 @@
 // Forward-pass tests.
 //
-//   test_forward tiny <tiny.bin>   invariants on the random tiny checkpoint (no download):
-//                                  causality (a prefix's logits don't depend on later tokens),
-//                                  determinism, finite outputs, input validation.
-//   test_forward hf <models dir>   logits for every position vs HF float32 (models/logits_ref.bin
-//                                  from scripts/make_logits_ref.py): max abs diff <= 2e-3 and
-//                                  the argmax must match. Exits 77 (skipped) if files are missing.
+//   test_forward tiny <tiny.bin>
+//       Invariants on the random tiny checkpoint (no download): causality (a prefix's logits
+//       don't depend on later tokens), determinism, finite outputs, input validation.
+//   test_forward hf <gpt2.bin> <ref.bin>
+//       Differential test vs HF float32, using a reference from scripts/make_logits_ref.py
+//       (format v3). Compares log-probabilities (log-softmax of the logits), max abs diff
+//       <= 2e-3: over the full vocabulary at the stored rows, and for HF's top-20 tokens at
+//       every position. The argmax must match HF at every position. Exits 77 (skipped) if
+//       either file is missing. ctest runs it twice: forward_hf (6 prompts, every row) and
+//       diff_hf (tests/diff_prompts.jsonl: 94 prompts up to n_ctx, sampled rows; "slow").
 //
-// Why 2e-3 and not 1e-4: GPT-2 logits reach ~300, and HF's own float32 logits are up to ~6.5e-4
-// from the float64 truth, so no independent float32 implementation can match them to 1e-4.
-// Calibrated on scripts/make_logits_ref.py's prompts: correct code's worst is 7.9e-4; exact-erf
-// GELU gives 7.5e-2..0.72 (fails all prompts); LayerNorm eps 1e-6 fails 5 of 6 prompts.
+// Why log-probs at 2e-3 (the project first targeted raw logits within 1e-4): GPT-2 logits reach
+// ~300, and float32 logits, HF's own included, carry rare whole-row shifts of up to ~7e-3 vs a
+// float64 run. Softmax cancels those shifts; HF float32 log-probs stay within ~1e-3 of float64
+// at every position, flat with length. See README "Correctness" for the calibration.
 
 #include <chrono>
 #include <cmath>
@@ -36,7 +40,7 @@ static int failures = 0;
         }                                                 \
     } while (0)
 
-static constexpr double kTol = 2e-3;  // max abs logit difference vs HF float32
+static constexpr double kTol = 2e-3;  // max abs log-prob difference vs HF float32
 
 static void test_tiny(const std::string& path) {
     const gpt2::Model m = gpt2::Model::load(path);
@@ -74,80 +78,131 @@ static void test_tiny(const std::string& path) {
     rejects("a sequence longer than n_ctx", std::vector<int>(m.config().n_ctx + 1, 0));
 }
 
-static int test_hf(const std::string& dir) {
-    std::ifstream f(dir + "/logits_ref.bin", std::ios::binary);
-    if (!f || !std::ifstream(dir + "/gpt2.bin")) {
-        std::printf("SKIP: need %s/gpt2.bin and logits_ref.bin (scripts/export_gpt2.py, "
-                    "scripts/make_logits_ref.py)\n", dir.c_str());
+struct Reader {
+    std::ifstream f;
+    std::string path;
+    void read(void* dst, size_t n) {
+        f.read(static_cast<char*>(dst), static_cast<std::streamsize>(n));
+        if (!f) throw std::runtime_error(path + ": truncated");
+    }
+    uint32_t u32() {
+        uint32_t v;
+        read(&v, 4);  // little-endian host
+        return v;
+    }
+    template <typename T>
+    std::vector<T> vec(size_t n) {
+        std::vector<T> v(n);
+        read(v.data(), n * sizeof(T));
+        return v;
+    }
+};
+
+// Log-softmax of one row, in double.
+static void log_softmax(const float* x, size_t n, std::vector<double>& out) {
+    out.resize(n);
+    double mx = x[0];
+    for (size_t j = 1; j < n; ++j) mx = std::fmax(mx, x[j]);
+    double sum = 0;
+    for (size_t j = 0; j < n; ++j) sum += std::exp(double(x[j]) - mx);
+    const double lse = mx + std::log(sum);
+    for (size_t j = 0; j < n; ++j) out[j] = double(x[j]) - lse;
+}
+
+static int test_hf(const std::string& model_path, const std::string& ref_path) {
+    Reader r{std::ifstream(ref_path, std::ios::binary), ref_path};
+    if (!r.f || !std::ifstream(model_path)) {
+        std::printf("SKIP: need %s and %s (scripts/export_gpt2.py, scripts/make_logits_ref.py)\n",
+                    model_path.c_str(), ref_path.c_str());
         return 77;
     }
-    const gpt2::Model m = gpt2::Model::load(dir + "/gpt2.bin");
-    const auto u32 = [&] {
-        uint32_t v = 0;
-        f.read(reinterpret_cast<char*>(&v), 4);  // little-endian host
-        if (!f) throw std::runtime_error("logits_ref.bin: truncated");
-        return v;
-    };
+    const gpt2::Model m = gpt2::Model::load(model_path);
     char magic[4];
-    f.read(magic, 4);
-    if (!f || std::memcmp(magic, "LGTS", 4) != 0 || u32() != 1)
-        throw std::runtime_error("logits_ref.bin: bad header");
-    const uint32_t n_prompts = u32(), V = u32();
+    r.read(magic, 4);
+    if (std::memcmp(magic, "LGTS", 4) != 0 || r.u32() != 3)
+        throw std::runtime_error(ref_path + ": bad header (regenerate with make_logits_ref.py)");
+    const uint32_t n_prompts = r.u32(), V = r.u32(), K = r.u32();
     CHECK(V == static_cast<uint32_t>(m.config().vocab_size), "vocab size mismatch");
 
-    double worst = 0;
+    double worst = 0, total_ms = 0;
+    std::string worst_name;
+    size_t total_tokens = 0, total_rows = 0, total_mismatch = 0;
+    std::vector<double> lp;
     for (uint32_t p = 0; p < n_prompts; ++p) {
-        const uint32_t T = u32();
-        std::vector<int> ids(T);
-        std::vector<float> want(static_cast<size_t>(T) * V);
-        f.read(reinterpret_cast<char*>(ids.data()), T * sizeof(int));
-        f.read(reinterpret_cast<char*>(want.data()), want.size() * sizeof(float));
-        if (!f) throw std::runtime_error("logits_ref.bin: truncated");
+        std::string name(r.u32(), '\0');
+        r.read(name.data(), name.size());
+        const uint32_t T = r.u32();
+        const std::vector<int> ids = r.vec<int>(T);
+        const std::vector<int> top1 = r.vec<int>(T);
+        const std::vector<float> gap = r.vec<float>(T);
+        const std::vector<int> topk_ids = r.vec<int>(size_t(T) * K);
+        const std::vector<float> topk_lp = r.vec<float>(size_t(T) * K);
+        const std::vector<uint32_t> rows = r.vec<uint32_t>(r.u32());
+        const std::vector<float> want = r.vec<float>(rows.size() * size_t(V));
 
         const auto t0 = std::chrono::steady_clock::now();
         const std::vector<float> got = gpt2::forward(m, ids);
         const double ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+
+        // Every position: argmax, and log-probs of HF's top-K tokens.
+        size_t mismatch = 0, row_k = 0;
         double max_diff = 0;
-        size_t argmax_mismatch = 0;
         for (uint32_t t = 0; t < T; ++t) {
-            const float* g = got.data() + static_cast<size_t>(t) * V;
-            const float* w = want.data() + static_cast<size_t>(t) * V;
-            size_t ag = 0, aw = 0;
-            for (uint32_t j = 0; j < V; ++j) {
-                max_diff = std::fmax(max_diff, std::fabs(double(g[j]) - w[j]));
+            const float* g = got.data() + size_t(t) * V;
+            uint32_t ag = 0;
+            for (uint32_t j = 1; j < V; ++j)
                 if (g[j] > g[ag]) ag = j;
-                if (w[j] > w[aw]) aw = j;
+            if (static_cast<int>(ag) != top1[t]) {
+                ++mismatch;
+                std::printf("  %s pos %u: argmax %u, HF %d (HF top1-top2 gap %.3g)\n",
+                            name.c_str(), t, ag, top1[t], gap[t]);
             }
-            argmax_mismatch += ag != aw;
+            log_softmax(g, V, lp);
+            for (uint32_t k = 0; k < K; ++k) {
+                const size_t i = size_t(t) * K + k;
+                max_diff = std::fmax(max_diff, std::fabs(lp[topk_ids[i]] - topk_lp[i]));
+            }
+            // Full vocabulary at the stored rows (sorted, so walk them alongside t).
+            if (row_k < rows.size() && rows[row_k] == t) {
+                const float* w = want.data() + row_k * V;
+                for (uint32_t j = 0; j < V; ++j)
+                    max_diff = std::fmax(max_diff, std::fabs(lp[j] - w[j]));
+                ++row_k;
+            }
         }
-        std::printf("prompt %u: T=%3u  max|diff|=%.3g (%3.0f%% of tolerance)  "
-                    "argmax mismatches=%zu  (%.0f ms)\n",
-                    p, T, max_diff, 100 * max_diff / kTol, argmax_mismatch, ms);
-        CHECK(max_diff <= kTol, "prompt %u: max abs diff %.3g > %.0e", p, max_diff, kTol);
-        CHECK(argmax_mismatch == 0, "prompt %u: argmax differs at %zu positions", p,
-              argmax_mismatch);
-        worst = std::fmax(worst, max_diff);
+        CHECK(row_k == rows.size(), "%s: stored rows not sorted or out of range", name.c_str());
+        std::printf("%-34s T=%4u rows=%3zu  max|dlogp|=%.3g (%3.0f%% of tol)  argmax mism=%zu  "
+                    "%.0f ms\n",
+                    name.c_str(), T, rows.size(), max_diff, 100 * max_diff / kTol, mismatch, ms);
+        CHECK(max_diff <= kTol, "%s: max abs log-prob diff %.3g > %.0e", name.c_str(), max_diff,
+              kTol);
+        CHECK(mismatch == 0, "%s: argmax differs at %zu positions", name.c_str(), mismatch);
+        if (max_diff > worst) worst = max_diff, worst_name = name;
+        total_ms += ms;
+        total_tokens += T;
+        total_rows += rows.size();
+        total_mismatch += mismatch;
     }
-    std::printf("worst max|diff| over %u prompts: %.3g (%.0f%% of tolerance %.0e)\n", n_prompts,
-                worst, 100 * worst / kTol, kTol);
+    std::printf("%u prompts, %zu tokens (argmax + top-%u log-probs checked at all), %zu full rows: "
+                "worst max|dlogp| %.3g (%.0f%% of tolerance %.0e) in %s; %zu argmax mismatches; "
+                "forward %.1f s\n",
+                n_prompts, total_tokens, K, total_rows, worst, 100 * worst / kTol, kTol,
+                worst_name.c_str(), total_mismatch, total_ms / 1000);
     return 0;
 }
 
 int main(int argc, char** argv) {
-    if (argc < 3) {
-        std::fprintf(stderr, "usage: %s tiny <tiny.bin> | hf <models dir>\n", argv[0]);
+    const std::string mode = argc > 1 ? argv[1] : "";
+    if (!((mode == "tiny" && argc == 3) || (mode == "hf" && argc == 4))) {
+        std::fprintf(stderr, "usage: %s tiny <tiny.bin> | hf <gpt2.bin> <ref.bin>\n", argv[0]);
         return 2;
     }
-    const std::string mode = argv[1];
     try {
         if (mode == "tiny") {
             test_tiny(argv[2]);
-        } else if (mode == "hf") {
-            if (test_hf(argv[2]) == 77) return 77;
-        } else {
-            std::fprintf(stderr, "unknown mode %s\n", mode.c_str());
-            return 2;
+        } else if (test_hf(argv[2], argv[3]) == 77) {
+            return 77;
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: unexpected exception: %s\n", e.what());
