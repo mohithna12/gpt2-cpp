@@ -10,7 +10,7 @@ GPT-2 inference in C++17 with no ML-framework dependencies.
 - [x] Phase 3: differential tests against HF (94 prompts up to n_ctx; log-probs within 2e-3, argmax equal)
 - [x] Phase 4: KV cache
 - [x] Phase 5: blocked / SIMD GEMM (NEON)
-- [ ] Phase 6: multithreading
+- [x] Phase 6: multithreading (thread pool, 6 performance cores by default)
 - [ ] Phase 7: CLI sampling, benchmarks, results table
 
 ## Quick start
@@ -45,7 +45,9 @@ are skipped if those are missing. `diff_hf` is labelled `slow`: `ctest -LE slow`
 that under ASan, where it would take hours at current speed).
 
 Debug with sanitizers: `cmake -S . -B build-asan -DGPT2_SANITIZE=ON`. On ARM the kernels use
-NEON; `-DGPT2_NO_SIMD=ON` builds the portable scalar path instead (also tested).
+NEON; `-DGPT2_NO_SIMD=ON` builds the portable scalar path instead (also tested). Race checks:
+`cmake -S . -B build-tsan -DGPT2_TSAN=ON`. Thread count: `GPT2_THREADS=n` (default: the number
+of performance cores, 6 on an M2 Pro). Results are bit-identical for any thread count.
 
 ## Layout
 
@@ -64,11 +66,12 @@ src/tokenizer.{h,cpp}           byte-level BPE: pre-tokenizer, merges, encode/de
 src/unicode_tables.h            generated letter/number/space code point ranges
 src/ops.{h,cpp}                 layernorm, matmul, GELU, attention (NEON + scalar fallback)
 src/forward.{h,cpp}             forward pass with KV cache: new tokens -> logits
+src/threadpool.{h,cpp}          persistent pool, dynamic task handout, spin-then-sleep
 src/main.cpp                    CLI: inspect, encode, decode, generate, bench
 tests/test_loader.cpp           loader vs reference stats, corrupt-file rejection
 tests/test_tokenizer.cpp        5098 HF-generated cases, invalid UTF-8 round trips, bad files
 tests/test_forward.cpp          tiny-model invariants (causality, KV cache = full pass bit for
-                                bit); vs HF, both full prefill and token-by-token decode
+                                bit); 1..10 threads bit-identical; vs HF, prefill and decode
 tests/diff_prompts.jsonl        differential-test prompt set (committed)
 ```
 
@@ -135,9 +138,34 @@ Invalid UTF-8, which HF can't receive, is tokenized byte by byte and decodes bac
 
 ## Benchmarks
 
-Apple M2 Pro, Release build, single thread. `gpt2 bench models T` (prefill T tokens with all
-logits, then 32 cached decode steps), best of 3 runs of best-of-3; `gpt2 generate` for greedy
-generation. Run-to-run noise on this machine is up to ~20%.
+Apple M2 Pro (6 performance + 4 efficiency cores), Release build. `gpt2 bench models T`
+prefills T tokens with all logits, then does 32 cached decode steps; best of 3 runs of
+best-of-3. `gpt2 generate` gives greedy generation. This machine is also in normal use, and
+run-to-run noise reaches 20–35%. Compare within a table, where rows were measured together;
+across phases, prefer interleaved A/B runs of both builds (as in the phase 6 steps).
+
+Phase 6, current code (all rows measured together):
+
+| | 1 thread | 6 threads (default) | 10 threads |
+|---|---|---|---|
+| Prefill T=1 / 64 / 256 / 900 | 17 / 267 / 1016 / 4250 ms | 8 / 58 / 212 / 874 ms | 13 / 61 / 200 / 789 ms |
+| Decode step after T=1 / 64 / 256 / 900 | 17.3 / 18.0 / 19.1 / 26.6 ms | 8.2 / 8.4 / 8.9 / 10.7 ms | 13.0 / 12.6 / 12.5 / 15.7 ms |
+| Greedy generate, 5 / 64-token prompt | | 108–121 / 101–116 tok/s | |
+
+6 threads: prefill 4.6–4.9× the single-thread speed, decode 2.1× (2.5× at T=900). Decode is
+bound by memory bandwidth and synchronization (~75 parallel jobs per token). 10 threads help
+long prefills slightly but slow decode, since the efficiency cores lag.
+
+Phase 6 steps (A/B = both builds run interleaved in the same session):
+
+| Step | Result |
+|---|---|
+| Pool + 64-column chunks for every matmul | 6 threads: prefill T=256 1495 → 302 ms. But 1 thread decode 2.6× slower than phase 5: narrow chunks cut W rows into strided 256-byte pieces |
+| Decode (T<4) gets one contiguous column range per thread | 6-thread decode 14.0 → 11.2 ms; 1-thread short-context decode back to phase-5 speed (A/B) |
+| Attention body out of the task lambda (locals, raw scores pointer) | A/B at 1 thread, T=900: removed a consistent ~15% decode slowdown vs phase 5 |
+| Spin ~100 µs before sleeping (workers and caller) | A/B at 6 threads: decode faster in 8 of 8 pairs (~10%, e.g. 11.7 → 9.0 ms); prefill unchanged |
+
+Earlier phases (single thread; measured in their own sessions, so compare within a column):
 
 | What | Phase 2 (naive) | Phase 4 (KV cache) | Phase 5 (NEON) |
 |---|---|---|---|

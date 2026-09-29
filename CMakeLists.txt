@@ -10,6 +10,11 @@ endif()
 
 add_compile_options(-Wall -Wextra -Wpedantic)
 option(GPT2_SANITIZE "Build with AddressSanitizer + UBSan" OFF)
+option(GPT2_TSAN "Build with ThreadSanitizer (not combinable with GPT2_SANITIZE)" OFF)
+if(GPT2_TSAN)
+  add_compile_options(-fsanitize=thread -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=thread)
+endif()
 option(GPT2_NO_SIMD "Use the portable scalar kernels even where NEON is available" OFF)
 if(GPT2_NO_SIMD)
   add_compile_definitions(GPT2_NO_SIMD)
@@ -19,7 +24,10 @@ if(GPT2_SANITIZE)
   add_link_options(-fsanitize=address,undefined)
 endif()
 
-add_library(gpt2core src/model.cpp src/tokenizer.cpp src/ops.cpp src/forward.cpp)
+add_library(gpt2core src/model.cpp src/tokenizer.cpp src/ops.cpp src/forward.cpp
+            src/threadpool.cpp)
+find_package(Threads REQUIRED)
+target_link_libraries(gpt2core PUBLIC Threads::Threads)
 target_include_directories(gpt2core PUBLIC src)
 
 add_executable(gpt2 src/main.cpp)
@@ -75,6 +83,8 @@ add_test(NAME forward_hf
          COMMAND test_forward hf ${CMAKE_SOURCE_DIR}/models/gpt2.bin
                  ${CMAKE_SOURCE_DIR}/models/logits_ref.bin
          WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+add_test(NAME forward_threads COMMAND test_forward threads ${CMAKE_SOURCE_DIR}/models/gpt2.bin
+         WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME forward_hf_decode
          COMMAND test_forward decode ${CMAKE_SOURCE_DIR}/models/gpt2.bin
                  ${CMAKE_SOURCE_DIR}/models/logits_ref.bin
@@ -83,5 +93,6 @@ add_test(NAME diff_hf
          COMMAND test_forward hf ${CMAKE_SOURCE_DIR}/models/gpt2.bin
                  ${CMAKE_SOURCE_DIR}/models/diff_ref.bin
          WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-set_tests_properties(forward_hf forward_hf_decode diff_hf PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(forward_hf forward_threads forward_hf_decode diff_hf PROPERTIES
+                     SKIP_RETURN_CODE 77)
 set_tests_properties(diff_hf PROPERTIES LABELS slow TIMEOUT 3600)

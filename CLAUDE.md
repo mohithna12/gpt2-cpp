@@ -6,7 +6,8 @@ checkpoint format (spec lives in `scripts/gpt2bin.py`).
 ## Machine
 
 Apple M2 Pro, macOS 15, **arm64: SIMD target is NEON** (FEAT_DotProd, FP16, BF16, I8MM
-available; no AVX). 10 cores (6 performance + 4 efficiency). Apple clang 16.
+available; no AVX). 10 cores (6 performance + 4 efficiency). Apple clang 16. The pool defaults
+to the 6 P-cores: more threads slow decode.
 
 ## Commands
 
@@ -21,6 +22,10 @@ cmake -S . -B build && cmake --build build -j          # Release (default)
 
 cmake -S . -B build-asan -DGPT2_SANITIZE=ON && cmake --build build-asan -j   # ASan+UBSan
 (cd build-asan && ctest --output-on-failure)             # diff_hf ~8 min under ASan
+
+cmake -S . -B build-tsan -DGPT2_TSAN=ON && cmake --build build-tsan -j        # races
+(cd build-tsan && ctest -LE slow --output-on-failure)
+GPT2_THREADS=1 ./build/gpt2 bench models 64               # thread count (default: P-cores)
 
 python scripts/export_gpt2.py --model gpt2 --out models   # gpt2.bin, vocab.json, merges.txt
 ./build/gpt2 inspect models/gpt2.bin                      # params: 124439808
@@ -53,8 +58,11 @@ python scripts/make_logits_ref.py --prompts tests/diff_prompts.jsonl --rows samp
   computes each output element in the same order whatever the tile shape or T: `matmul` as one
   sequential FMA chain over k from the bias (4x16 tile, streaming row kernel, and scalar tails
   all agree), and dot products (LM head, attention) as 4-lane FMA partials + `vaddvq_f32` +
-  a scalar `std::fma` tail. Keep that property in phase 6 (split work by rows/columns, never
-  split one element's k-reduction across threads) or ask before relaxing the test.
+  a scalar `std::fma` tail. Threads split output columns (matmul, LM head), (head, query)
+  pairs (attention) or elements (GELU), never one element's k-reduction, so results are
+  bit-identical for any thread count (`forward_threads`). Keep it that way or ask first.
+- Thread pool (`src/threadpool.cpp`): one process-wide pool; tasks are handed out through an
+  atomic counter; workers spin ~100 µs before sleeping. Run TSan after touching it.
 - SIMD: NEON intrinsics under `GPT2_NEON` in `src/ops.cpp`; the scalar path stays as the
   portable fallback (`-DGPT2_NO_SIMD=ON` builds and tests it).
 - Tokenizer ground truth is HF's Rust tokenizer, not Python `unicodedata`.
@@ -64,7 +72,9 @@ python scripts/make_logits_ref.py --prompts tests/diff_prompts.jsonl --rows samp
 ## The rule for optimizations
 
 Every optimization must (1) keep the differential test passing and (2) be benchmarked before
-and after (`./build/gpt2 bench models [T]`). Record the numbers in the README.
+and after (`./build/gpt2 bench models [T]`). Record the numbers in the README. The machine is in
+everyday use, so noise reaches 20–35%. Benchmark before/after as an interleaved A/B of both
+binaries in one session, not against numbers from an earlier session.
 
 The differential test (`forward_hf` + `diff_hf`, `tests/test_forward.cpp`): log-probs within
 2e-3 of HF float32, and argmax equal wherever HF's top1-top2 gap is >= 2e-3. At closer
@@ -91,6 +101,5 @@ against a float64 HF run before calling it a regression.
 - [x] 3: differential tests vs HF (94 prompts to n_ctx, log-probs 2e-3, argmax)
 - [x] 4: KV cache (`KVCache`, `forward(m, cache, tokens, Logits::All|Last)`)
 - [x] 5: blocked / SIMD GEMM: NEON LM head, 4x16 matmul tiles, row kernel, attention
-- [ ] **6: multithreading: CURRENT.** Decode is now bound by memory bandwidth (~500 MB of weights
-  per token on one core), so threads should help decode as well as prefill.
-- [ ] 7: CLI sampling, benchmarks, results table
+- [x] 6: multithreading (6 threads: prefill ~4.8x, decode ~2.1x vs 1 thread)
+- [ ] **7: CLI sampling, benchmarks, results table: CURRENT**

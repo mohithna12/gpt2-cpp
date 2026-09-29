@@ -13,6 +13,9 @@
 //       of HF's top-20, whose log-probs are checked anyway. Exits 77 (skipped) if either file is
 //       missing. ctest runs it twice: forward_hf (6 prompts, every row) and
 //       diff_hf (tests/diff_prompts.jsonl: 94 prompts up to n_ctx, sampled rows; "slow").
+//   test_forward threads <gpt2.bin>
+//       Results must not depend on the thread count: prefill and cached decode of a fixed
+//       sequence with 1, 2, 3, 6 and 10 threads must be bit-identical. Exits 77 if missing.
 //   test_forward decode <gpt2.bin> <ref.bin>
 //       Same comparison, but tokens are fed one at a time through the KV cache (the generation
 //       path). ctest runs it on the forward_hf prompts as forward_hf_decode.
@@ -34,6 +37,7 @@
 
 #include "forward.h"
 #include "model.h"
+#include "threadpool.h"
 
 static int failures = 0;
 #define CHECK(cond, ...)                                  \
@@ -261,16 +265,51 @@ static int test_hf(const std::string& model_path, const std::string& ref_path, b
     return 0;
 }
 
+static int test_threads(const std::string& model_path) {
+    if (!std::ifstream(model_path)) {
+        std::printf("SKIP: need %s (scripts/export_gpt2.py)\n", model_path.c_str());
+        return 77;
+    }
+    const gpt2::Model m = gpt2::Model::load(model_path);
+    std::vector<int> ids;
+    for (int i = 0; i < 40; ++i) ids.push_back((i * 7919 + 13) % m.config().vocab_size);
+    const auto run = [&](int n_threads) {
+        gpt2::set_num_threads(n_threads);
+        gpt2::KVCache cache(m.config());
+        std::vector<float> out = gpt2::forward(m, cache, ids);  // prefill (4x16 tiles)
+        for (int i = 0; i < 5; ++i) {                            // decode (row kernel)
+            const std::vector<float> step = gpt2::forward(m, cache, {ids[i]});
+            out.insert(out.end(), step.begin(), step.end());
+        }
+        return out;
+    };
+    const std::vector<float> ref = run(1);
+    for (int n : {2, 3, 6, 10}) {
+        const std::vector<float> got = run(n);
+        CHECK(got.size() == ref.size() &&
+                  std::memcmp(got.data(), ref.data(), ref.size() * sizeof(float)) == 0,
+              "%d threads give different logits than 1 thread", n);
+        std::printf("%2d threads: bit-identical to 1 thread: %s\n", n, got == ref ? "yes" : "NO");
+    }
+    gpt2::set_num_threads(gpt2::default_num_threads());
+    return 0;
+}
+
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "";
-    if (!((mode == "tiny" && argc == 3) || ((mode == "hf" || mode == "decode") && argc == 4))) {
-        std::fprintf(stderr, "usage: %s tiny <tiny.bin> | {hf|decode} <gpt2.bin> <ref.bin>\n",
+    if (!((mode == "tiny" && argc == 3) || (mode == "threads" && argc == 3) ||
+          ((mode == "hf" || mode == "decode") && argc == 4))) {
+        std::fprintf(stderr,
+                     "usage: %s tiny <tiny.bin> | threads <gpt2.bin> | "
+                     "{hf|decode} <gpt2.bin> <ref.bin>\n",
                      argv[0]);
         return 2;
     }
     try {
         if (mode == "tiny") {
             test_tiny(argv[2]);
+        } else if (mode == "threads") {
+            if (test_threads(argv[2]) == 77) return 77;
         } else if (test_hf(argv[2], argv[3], mode == "decode") == 77) {
             return 77;
         }

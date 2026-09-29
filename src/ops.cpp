@@ -1,7 +1,10 @@
 #include "ops.h"
 
+#include <algorithm>
 #include <cmath>
 #include <vector>
+
+#include "threadpool.h"
 
 #if defined(__ARM_NEON) && !defined(GPT2_NO_SIMD)
 #include <arm_neon.h>
@@ -65,20 +68,20 @@ inline void matmul_tile_4x16(float* out, const float* x, const float* W, const f
         for (int c = 0; c < 4; ++c) vst1q_f32(out + (t + r) * N + j + 4 * c, acc[r][c]);
 }
 
-// One row of out = x @ W + bias over columns [j0, N) (the T=1 decode path). Streams W rows
+// One row of out = x @ W + bias over columns [j0, j1) (the T=1 decode path). Streams W rows
 // contiguously, four k at a time, so the output row is loaded and stored once per 4 k instead
 // of once per k. Per element this is the same arithmetic as the tile: a sequential FMA chain
 // over k from the bias.
 inline void matmul_row(float* o, const float* xr, const float* W, const float* bias, int64_t K,
-                       int64_t N, int64_t j0) {
-    for (int64_t j = j0; j < N; ++j) o[j] = bias ? bias[j] : 0.0f;
+                       int64_t N, int64_t j0, int64_t j1) {
+    for (int64_t j = j0; j < j1; ++j) o[j] = bias ? bias[j] : 0.0f;
     int64_t k = 0;
     for (; k + 4 <= K; k += 4) {
         const float32x4_t x0 = vdupq_n_f32(xr[k]), x1 = vdupq_n_f32(xr[k + 1]),
                           x2 = vdupq_n_f32(xr[k + 2]), x3 = vdupq_n_f32(xr[k + 3]);
         const float *w0 = W + k * N, *w1 = w0 + N, *w2 = w1 + N, *w3 = w2 + N;
         int64_t j = j0;
-        for (; j + 4 <= N; j += 4) {
+        for (; j + 4 <= j1; j += 4) {
             float32x4_t a = vld1q_f32(o + j);
             a = vfmaq_f32(a, x0, vld1q_f32(w0 + j));
             a = vfmaq_f32(a, x1, vld1q_f32(w1 + j));
@@ -86,7 +89,7 @@ inline void matmul_row(float* o, const float* xr, const float* W, const float* b
             a = vfmaq_f32(a, x3, vld1q_f32(w3 + j));
             vst1q_f32(o + j, a);
         }
-        for (; j < N; ++j) {
+        for (; j < j1; ++j) {
             float a = o[j];
             a = std::fma(xr[k], w0[j], a);
             a = std::fma(xr[k + 1], w1[j], a);
@@ -96,7 +99,7 @@ inline void matmul_row(float* o, const float* xr, const float* W, const float* b
     }
     for (; k < K; ++k) {
         const float* wk = W + k * N;
-        for (int64_t j = j0; j < N; ++j) o[j] = std::fma(xr[k], wk[j], o[j]);
+        for (int64_t j = j0; j < j1; ++j) o[j] = std::fma(xr[k], wk[j], o[j]);
     }
 }
 #endif
@@ -119,49 +122,53 @@ void layernorm(float* out, const float* x, const float* w, const float* b, int64
     }
 }
 
-void matmul(float* out, const float* x, const float* W, const float* bias, int64_t T, int64_t K,
-            int64_t N) {
+namespace {
+
+// Columns [j0, j1) of out[T, N] = x @ W + bias. j0 must be a multiple of 16.
+void matmul_cols(float* out, const float* x, const float* W, const float* bias, int64_t T,
+                 int64_t K, int64_t N, int64_t j0, int64_t j1) {
 #if GPT2_NEON
     // 16-column stripes of W (K x 16 floats) outside, 4-row tiles of x inside, so a stripe
     // stays in cache while every row tile passes over it. Leftover rows and columns go through
     // matmul_row, which computes each element identically.
-    const int64_t T4 = T / 4 * 4, N16 = N / 16 * 16;
-    for (int64_t j = 0; j < N16; j += 16)
+    const int64_t T4 = T / 4 * 4, j16 = j0 + (j1 - j0) / 16 * 16;
+    for (int64_t j = j0; j < j16; j += 16)
         for (int64_t t = 0; t < T4; t += 4) matmul_tile_4x16(out, x, W, bias, K, N, t, j);
-    for (int64_t t = 0; t < T4; ++t)
-        if (N16 < N) matmul_row(out + t * N, x + t * K, W, bias, K, N, N16);
-    for (int64_t t = T4; t < T; ++t) matmul_row(out + t * N, x + t * K, W, bias, K, N, 0);
+    if (j16 < j1)
+        for (int64_t t = 0; t < T4; ++t) matmul_row(out + t * N, x + t * K, W, bias, K, N, j16, j1);
+    for (int64_t t = T4; t < T; ++t) matmul_row(out + t * N, x + t * K, W, bias, K, N, j0, j1);
 #else
     // i-k-j order so the inner loop walks rows of W contiguously.
     for (int64_t t = 0; t < T; ++t) {
         float* o = out + t * N;
-        for (int64_t j = 0; j < N; ++j) o[j] = bias ? bias[j] : 0.0f;
+        for (int64_t j = j0; j < j1; ++j) o[j] = bias ? bias[j] : 0.0f;
         for (int64_t k = 0; k < K; ++k) {
             const float xk = x[t * K + k];
             const float* wr = W + k * N;
-            for (int64_t j = 0; j < N; ++j) o[j] += xk * wr[j];
+            for (int64_t j = j0; j < j1; ++j) o[j] += xk * wr[j];
         }
     }
 #endif
 }
 
-void matmul_transposed(float* out, const float* x, const float* W, int64_t T, int64_t K,
-                       int64_t N) {
+// Rows [j0, j1) of W, i.e. columns [j0, j1) of out[T, N] = x @ W^T.
+void matmul_transposed_cols(float* out, const float* x, const float* W, int64_t T, int64_t K,
+                            int64_t N, int64_t j0, int64_t j1) {
 #if GPT2_NEON
     // Tiles of 4 x-rows by 4 W-rows: each W row is loaded once per 4 positions, and the 4 W rows
     // (4K floats) stay in L1 while every x row passes over them.
-    int64_t j = 0;
-    for (; j + 4 <= N; j += 4) {
+    int64_t j = j0;
+    for (; j + 4 <= j1; j += 4) {
         int64_t t = 0;
         for (; t + 4 <= T; t += 4) dot_tile<4, 4>(out + t * N + j, N, x + t * K, W + j * K, K);
         for (; t < T; ++t) dot_tile<1, 4>(out + t * N + j, N, x + t * K, W + j * K, K);
     }
-    for (; j < N; ++j)
+    for (; j < j1; ++j)
         for (int64_t t = 0; t < T; ++t) dot_tile<1, 1>(out + t * N + j, N, x + t * K, W + j * K, K);
 #else
     for (int64_t t = 0; t < T; ++t) {
         const float* xr = x + t * K;
-        for (int64_t j = 0; j < N; ++j) {
+        for (int64_t j = j0; j < j1; ++j) {
             const float* wr = W + j * K;
             float s = 0;
             for (int64_t k = 0; k < K; ++k) s += xr[k] * wr[k];
@@ -171,62 +178,110 @@ void matmul_transposed(float* out, const float* x, const float* W, int64_t T, in
 #endif
 }
 
+// Splits [0, n) into chunks of `chunk` (the last may be shorter) and runs them on the pool.
+template <typename F>
+void parallel_chunks(int64_t n, int64_t chunk, F&& f) {
+    const int64_t tasks = (n + chunk - 1) / chunk;
+    pool().parallel_for(tasks, [&](int64_t i) { f(i * chunk, std::min(n, (i + 1) * chunk)); });
+}
+
+}  // namespace
+
+// Threads split the output columns; each element is still computed by one thread, in the same
+// order, so results don't depend on the thread count.
+void matmul(float* out, const float* x, const float* W, const float* bias, int64_t T, int64_t K,
+            int64_t N) {
+    // Few rows (decode) run the row kernel, which streams whole W rows. Narrow column chunks
+    // would cut each W row into short strided pieces the prefetcher handles badly (measured:
+    // 2.6x slower single-threaded), so give each thread one wide contiguous range instead.
+    // Tiled prefill walks 16-column stripes anyway and balances better with small chunks.
+    const int64_t per_thread = (N + pool().size() - 1) / pool().size();
+    const int64_t chunk = T < 4 ? (per_thread + 15) / 16 * 16 : 64;
+    parallel_chunks(N, chunk, [&](int64_t j0, int64_t j1) {
+        matmul_cols(out, x, W, bias, T, K, N, j0, j1);
+    });
+}
+
+void matmul_transposed(float* out, const float* x, const float* W, int64_t T, int64_t K,
+                       int64_t N) {
+    parallel_chunks(N, 256, [&](int64_t j0, int64_t j1) {
+        matmul_transposed_cols(out, x, W, T, K, N, j0, j1);
+    });
+}
+
 void gelu(float* x, int64_t n) {
     constexpr float c = 0.7978845608028654f;  // sqrt(2 / pi)
-    for (int64_t i = 0; i < n; ++i) {
-        const float v = x[i];
-        x[i] = 0.5f * v * (1.0f + std::tanh(c * (v + 0.044715f * v * v * v)));
-    }
+    parallel_chunks(n, 16384, [&](int64_t i0, int64_t i1) {
+        for (int64_t i = i0; i < i1; ++i) {
+            const float v = x[i];
+            x[i] = 0.5f * v * (1.0f + std::tanh(c * (v + 0.044715f * v * v * v)));
+        }
+    });
 }
 
 void add_inplace(float* out, const float* x, int64_t n) {
     for (int64_t i = 0; i < n; ++i) out[i] += x[i];
 }
 
+namespace {
+
+// Attention output for one head h and one query t (absolute position pos0 + t).
+void attention_one(float* out, const float* qkv, const float* k, const float* v, int64_t h,
+                   int64_t t, int64_t pos0, int64_t C, int64_t hd, float scale,
+                   std::vector<float>& scores_buf) {
+    const int64_t n = pos0 + t + 1;  // causal: positions 0..pos0+t
+    if (static_cast<int64_t>(scores_buf.size()) < n) scores_buf.resize(n);
+    float* scores = scores_buf.data();
+    const float* q = qkv + t * 3 * C + h * hd;
+    // Scores, then a stable softmax.
+    float mx = -INFINITY;
+    for (int64_t s = 0; s < n; ++s) {
+        const float* ks = k + s * C + h * hd;
+#if GPT2_NEON
+        float dot;
+        dot_tile<1, 1>(&dot, 1, q, ks, hd);
+#else
+        float dot = 0;
+        for (int64_t i = 0; i < hd; ++i) dot += q[i] * ks[i];
+#endif
+        scores[s] = dot * scale;
+        if (scores[s] > mx) mx = scores[s];
+    }
+    float sum = 0;
+    for (int64_t s = 0; s < n; ++s) {
+        scores[s] = std::exp(scores[s] - mx);
+        sum += scores[s];
+    }
+    float* o = out + t * C + h * hd;
+    for (int64_t i = 0; i < hd; ++i) o[i] = 0;
+    for (int64_t s = 0; s < n; ++s) {
+        const float p = scores[s] / sum;
+        const float* vs = v + s * C + h * hd;
+#if GPT2_NEON
+        const float32x4_t pv = vdupq_n_f32(p);
+        int64_t i = 0;
+        for (; i + 4 <= hd; i += 4)
+            vst1q_f32(o + i, vfmaq_f32(vld1q_f32(o + i), pv, vld1q_f32(vs + i)));
+        for (; i < hd; ++i) o[i] = std::fma(p, vs[i], o[i]);
+#else
+        for (int64_t i = 0; i < hd; ++i) o[i] += p * vs[i];
+#endif
+    }
+}
+
+}  // namespace
+
 void attention(float* out, const float* qkv, const float* k, const float* v, int64_t T,
                int64_t pos0, int64_t C, int64_t n_head) {
     const int64_t hd = C / n_head;
     const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
-    std::vector<float> scores(pos0 + T);
-    for (int64_t h = 0; h < n_head; ++h) {
-        for (int64_t t = 0; t < T; ++t) {
-            const float* q = qkv + t * 3 * C + h * hd;
-            const int64_t n = pos0 + t + 1;  // causal: positions 0..pos0+t
-            // Scores, then a stable softmax.
-            float mx = -INFINITY;
-            for (int64_t s = 0; s < n; ++s) {
-                const float* ks = k + s * C + h * hd;
-#if GPT2_NEON
-                float dot;
-                dot_tile<1, 1>(&dot, 1, q, ks, hd);
-#else
-                float dot = 0;
-                for (int64_t i = 0; i < hd; ++i) dot += q[i] * ks[i];
-#endif
-                scores[s] = dot * scale;
-                if (scores[s] > mx) mx = scores[s];
-            }
-            float sum = 0;
-            for (int64_t s = 0; s < n; ++s) {
-                scores[s] = std::exp(scores[s] - mx);
-                sum += scores[s];
-            }
-            float* o = out + t * C + h * hd;
-            for (int64_t i = 0; i < hd; ++i) o[i] = 0;
-            for (int64_t s = 0; s < n; ++s) {
-                const float p = scores[s] / sum;
-                const float* vs = v + s * C + h * hd;
-#if GPT2_NEON
-                const float32x4_t pv = vdupq_n_f32(p);
-                int64_t i = 0;
-                for (; i + 4 <= hd; i += 4) vst1q_f32(o + i, vfmaq_f32(vld1q_f32(o + i), pv, vld1q_f32(vs + i)));
-                for (; i < hd; ++i) o[i] = std::fma(p, vs[i], o[i]);
-#else
-                for (int64_t i = 0; i < hd; ++i) o[i] += p * vs[i];
-#endif
-            }
-        }
-    }
+    // One task per (head, query); each writes its own hd-wide slice of out. The body works on
+    // local copies and a raw scores pointer: reading sizes through the closure and a
+    // thread_local vector inside the loops measured ~15% slower single-threaded at T=900.
+    pool().parallel_for(n_head * T, [=](int64_t task) {
+        thread_local std::vector<float> scores_buf;
+        attention_one(out, qkv, k, v, task / T, task % T, pos0, C, hd, scale, scores_buf);
+    });
 }
 
 }  // namespace gpt2::ops
