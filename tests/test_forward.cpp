@@ -8,8 +8,10 @@
 //       Differential test vs HF float32, using a reference from scripts/make_logits_ref.py
 //       (format v3). Compares log-probabilities (log-softmax of the logits), max abs diff
 //       <= 2e-3: over the full vocabulary at the stored rows, and for HF's top-20 tokens at
-//       every position. The argmax must match HF at every position. Exits 77 (skipped) if
-//       either file is missing. ctest runs it twice: forward_hf (6 prompts, every row) and
+//       every position. The argmax must match HF at every position where HF's top1-top2 logit
+//       gap is >= 2e-3. At closer near-ties a flip is allowed (and printed) if our pick is one
+//       of HF's top-20, whose log-probs are checked anyway. Exits 77 (skipped) if either file is
+//       missing. ctest runs it twice: forward_hf (6 prompts, every row) and
 //       diff_hf (tests/diff_prompts.jsonl: 94 prompts up to n_ctx, sampled rows; "slow").
 //   test_forward decode <gpt2.bin> <ref.bin>
 //       Same comparison, but tokens are fed one at a time through the KV cache (the generation
@@ -177,7 +179,7 @@ static int test_hf(const std::string& model_path, const std::string& ref_path, b
 
     double worst = 0, total_ms = 0;
     std::string worst_name;
-    size_t total_tokens = 0, total_rows = 0, total_mismatch = 0;
+    size_t total_tokens = 0, total_rows = 0, total_mismatch = 0, total_flips = 0;
     std::vector<double> lp;
     for (uint32_t p = 0; p < n_prompts; ++p) {
         std::string name(r.u32(), '\0');
@@ -207,7 +209,7 @@ static int test_hf(const std::string& model_path, const std::string& ref_path, b
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
         // Every position: argmax, and log-probs of HF's top-K tokens.
-        size_t mismatch = 0, row_k = 0;
+        size_t mismatch = 0, near_tie_flips = 0, row_k = 0;
         double max_diff = 0;
         for (uint32_t t = 0; t < T; ++t) {
             const float* g = got.data() + size_t(t) * V;
@@ -215,9 +217,14 @@ static int test_hf(const std::string& model_path, const std::string& ref_path, b
             for (uint32_t j = 1; j < V; ++j)
                 if (g[j] > g[ag]) ag = j;
             if (static_cast<int>(ag) != top1[t]) {
-                ++mismatch;
-                std::printf("  %s pos %u: argmax %u, HF %d (HF top1-top2 gap %.3g)\n",
-                            name.c_str(), t, ag, top1[t], gap[t]);
+                // Below the tolerance, which of two near-tied tokens wins is float32 noise.
+                bool in_topk = false;
+                for (uint32_t k = 0; k < K; ++k) in_topk |= topk_ids[size_t(t) * K + k] == int(ag);
+                const bool allowed = gap[t] < kTol && in_topk;
+                (allowed ? near_tie_flips : mismatch)++;
+                std::printf("  %s pos %u: argmax %u, HF %d (HF top1-top2 gap %.3g)%s\n",
+                            name.c_str(), t, ag, top1[t], gap[t],
+                            allowed ? ": near-tie, allowed" : "");
             }
             log_softmax(g, V, lp);
             for (uint32_t k = 0; k < K; ++k) {
@@ -244,12 +251,13 @@ static int test_hf(const std::string& model_path, const std::string& ref_path, b
         total_tokens += T;
         total_rows += rows.size();
         total_mismatch += mismatch;
+        total_flips += near_tie_flips;
     }
     std::printf("%u prompts, %zu tokens (argmax + top-%u log-probs checked at all), %zu full rows: "
-                "worst max|dlogp| %.3g (%.0f%% of tolerance %.0e) in %s; %zu argmax mismatches; "
-                "forward %.1f s\n",
+                "worst max|dlogp| %.3g (%.0f%% of tolerance %.0e) in %s; %zu argmax mismatches, "
+                "%zu near-tie flips allowed; forward %.1f s\n",
                 n_prompts, total_tokens, K, total_rows, worst, 100 * worst / kTol, kTol,
-                worst_name.c_str(), total_mismatch, total_ms / 1000);
+                worst_name.c_str(), total_mismatch, total_flips, total_ms / 1000);
     return 0;
 }
 

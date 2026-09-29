@@ -9,7 +9,7 @@ GPT-2 inference in C++17 with no ML-framework dependencies.
 - [x] Phase 2: naive forward pass
 - [x] Phase 3: differential tests against HF (94 prompts up to n_ctx; log-probs within 2e-3, argmax equal)
 - [x] Phase 4: KV cache
-- [ ] Phase 5: blocked / SIMD GEMM
+- [x] Phase 5: blocked / SIMD GEMM (NEON)
 - [ ] Phase 6: multithreading
 - [ ] Phase 7: CLI sampling, benchmarks, results table
 
@@ -44,7 +44,8 @@ The `tokenizer`, `forward_hf` and `diff_hf` tests need the generated files in `m
 are skipped if those are missing. `diff_hf` is labelled `slow`: `ctest -LE slow` skips it (do
 that under ASan, where it would take hours at current speed).
 
-Debug with sanitizers: `cmake -S . -B build-asan -DGPT2_SANITIZE=ON`.
+Debug with sanitizers: `cmake -S . -B build-asan -DGPT2_SANITIZE=ON`. On ARM the kernels use
+NEON; `-DGPT2_NO_SIMD=ON` builds the portable scalar path instead (also tested).
 
 ## Layout
 
@@ -61,7 +62,7 @@ src/tensor.h                    non-owning float32 tensor view
 src/model.{h,cpp}               Config, Weights, Model::load
 src/tokenizer.{h,cpp}           byte-level BPE: pre-tokenizer, merges, encode/decode
 src/unicode_tables.h            generated letter/number/space code point ranges
-src/ops.{h,cpp}                 layernorm, matmul, GELU, causal attention (plain loops)
+src/ops.{h,cpp}                 layernorm, matmul, GELU, attention (NEON + scalar fallback)
 src/forward.{h,cpp}             forward pass with KV cache: new tokens -> logits
 src/main.cpp                    CLI: inspect, encode, decode, generate, bench
 tests/test_loader.cpp           loader vs reference stats, corrupt-file rejection
@@ -84,6 +85,11 @@ max |diff| ≤ 2e-3, and the argmax must equal HF's at every position. Two ctest
   argmax and HF's top-20 log-probs at every position, and the full vocabulary at 961 sampled
   positions.
 
+The argmax must match wherever HF's top-1/top-2 gap is at least 2e-3. At closer near-ties (11 of
+10,070 positions) a flip is allowed, and printed, if our pick is one of HF's top-20, whose
+log-probs are checked anyway. The one flip today is a 4.7e-5 float64 gap at logit −95.6, where
+the NEON build is within 8e-5 of float64 on both tokens but lands on the other side.
+
 **Why log-probs within 2e-3 and not raw logits within 1e-4 (the original target):** GPT-2 logits
 reach ~300. Float32 logits, HF's own included, carry rare whole-row shifts vs a float64 run: up
 to 6.8e-3 for HF on a 512-token prompt, and 8e-3 between C++ and HF on 4 of 200 rows of a prose
@@ -95,7 +101,13 @@ stable: HF float32 stays within ~9e-4 of float64 at every position, flat with le
 | C++ vs HF float32, log-probs, worst prompts incl. 1024 tokens | 7.4e-4 |
 | HF float32 vs float64, log-probs | 9.7e-4 |
 | `diff_hf` as checked (top-20 everywhere + sampled full rows) | 2.8e-4 |
-| Argmax mismatches, 10,070 positions | 0 |
+| Argmax mismatches, 10,070 positions | 0 (1 allowed near-tie flip since phase 5) |
+
+Since phase 5 the worst `diff_hf` difference is 8.8e-4 (44%), up from 2.8e-4 with the scalar
+code. That's the NEON kernels being *more* accurate: against float64 they're 2–5× closer than
+the scalar code (e.g. 7.6e-4 → 2.8e-4), while the scalar LM head had happened to share HF's
+rounding. Since HF float32 is itself ~1e-3 from float64, a margin around 40–50% is the expected
+floor for an accurate implementation.
 
 Calibration with injected bugs (a bug counts as caught if any prompt fails):
 
@@ -105,6 +117,10 @@ Calibration with injected bugs (a bug counts as caught if any prompt fails):
 | LayerNorm eps 1e-4 | 5/6 fail, up to 35× | |
 | Attention scale ×1.001 | 5/6 fail, up to 25× | |
 | LayerNorm eps 1e-6 | 3/6 fail, up to 3.5× | 42/94 fail, up to 14× |
+| *Re-run on the phase 5 NEON kernels:* | | |
+| Exact-erf GELU | | 94/94 fail, up to 204× |
+| LayerNorm eps 1e-6 | | 44/94 fail, up to 14× |
+| Attention scale ×1.001 | | 92/94 fail, up to 95× |
 
 Greedy generation matches HF's `generate(do_sample=False)` token for token.
 
@@ -119,23 +135,34 @@ Invalid UTF-8, which HF can't receive, is tokenized byte by byte and decodes bac
 
 ## Benchmarks
 
-Apple M2 Pro, Release build, single thread.
+Apple M2 Pro, Release build, single thread. `gpt2 bench models T` (prefill T tokens with all
+logits, then 32 cached decode steps), best of 3 runs of best-of-3; `gpt2 generate` for greedy
+generation. Run-to-run noise on this machine is up to ~20%.
 
-| What | Input | Time | Notes |
+| What | Phase 2 (naive) | Phase 4 (KV cache) | Phase 5 (NEON) |
 |---|---|---|---|
-| `gpt2 encode` (naive BPE, no cache) | 1.86 MB, 768,200 tokens | 0.70 s end to end | includes ~0.02 s vocab load; ids identical to HF |
-| HF fast tokenizer `encode` (reference) | same | 1.11 s | Python call, for scale |
-| Forward, naive loops (phase 2) | T=1 | 56.7 ms | 17.6 tok/s |
-| Forward, naive loops (phase 2) | T=64 | 3186 ms | 20.1 tok/s, ~5 GFLOP/s |
-| Forward, naive loops (phase 2) | T=256 | 12869 ms | 19.9 tok/s |
-| Greedy generate, no KV cache (phase 2) | 5 + 20 tokens | 14.6 s | 1.37 tok/s |
-| Greedy generate, no KV cache (phase 3 code) | 64 + 20 tokens | 74.9 s | 0.27 tok/s |
-| Greedy generate, KV cache (phase 4) | 5 + 20 tokens | 0.23 s prefill + 1.26 s | 15.0 tok/s |
-| Greedy generate, KV cache (phase 4) | 64 + 20 tokens | 0.74 s prefill + 1.16 s | 16.4 tok/s |
-| Decode step, KV cache (phase 4) | after T=1 / 64 / 256 / 900 | 56.5 / 59.5 / 61.6 / 72.7 ms | 17.7 → 13.8 tok/s |
-| Prefill, all logits (phase 4) | T=64 / 256 | 3233 / 13257 ms | unchanged from phase 2 |
+| Prefill T=1, all logits | 56.7 ms | 53.1 ms | 19.6 ms |
+| Prefill T=64, all logits | 3186 ms | 3233 ms | 363 ms (8.9×) |
+| Prefill T=256, all logits | 12869 ms | 13257 ms | 1428 ms (9.3×) |
+| Prefill T=900, all logits | — | 48841 ms | 5954 ms (8.2×) |
+| Decode step after T=1 | — | 56.5 ms | 19.4–23.9 ms |
+| Decode step after T=64 | — | 59.5 ms | 20.8 ms |
+| Decode step after T=256 | — | 61.6 ms | 21.4 ms |
+| Decode step after T=900 | — | 72.7 ms | 29.8–35.3 ms |
+| Greedy generate, 5-token prompt | 1.32 tok/s | 15.0 tok/s | 41–46 tok/s |
+| Greedy generate, 64-token prompt | 0.27 tok/s | 16.4 tok/s | 40–42 tok/s |
 
-Prefill and decode numbers are `gpt2 bench models T`, best of 3. Generate numbers are from
-`gpt2 generate`. Prefill with all logits is dominated by the LM head: `matmul_transposed` is a
-dot-product reduction the compiler won't vectorize without fast-math. With only the last row's
-logits, a 64-token prefill takes 0.74 s instead of 3.2 s. That's the first target for phase 5.
+Phase 5 steps, each measured separately (prefill T=64 / decode after T=1):
+
+| Step | Prefill T=64 | Decode | Notes |
+|---|---|---|---|
+| Before (phase 4) | 3233 ms | 56.5 ms | LM head was ~75% of prefill, ~70% of decode |
+| 5a: NEON LM head, 4×4 dot tiles | 694 ms | 19.9 ms | |
+| 5b: matmul 4×16 tiles + row kernel | 377 ms | 28.1 ms | decode regressed: row kernel reloaded the output every k |
+| 5b': row kernel, 64-col register blocks | 370 ms | 91.3 ms | worse: strided W access defeats the prefetcher |
+| 5b'': row kernel streaming W, 4 k per pass | 372 ms | 20.6 ms | kept |
+| 5c: NEON attention (q·k, p·v) | 363 ms | 19.4 ms | T=900: prefill 7087 → 5959 ms, decode 34.0 → 29.8 ms |
+
+Tokenizer: `gpt2 encode` handles 1.86 MB (768,200 tokens) in 0.70 s end to end, including
+~0.02 s vocab load (naive BPE, no cache); ids identical to HF, whose fast tokenizer takes 1.11 s
+on the same input.
