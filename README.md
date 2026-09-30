@@ -2,6 +2,30 @@
 
 GPT-2 inference in C++17 with no ML-framework dependencies.
 
+## Results
+
+GPT-2 small (124M), Apple M2 Pro, 6 threads, measured interleaved with HF PyTorch
+(`scripts/bench_hf.py`) on the same prompt ids and the same definitions:
+
+| | This engine | HF PyTorch 2.14 (CPU) |
+|---|---|---|
+| Decode, after 64 / 512 tokens | **8.8 / 10.0 ms/token** | 41.5 / 30.6 ms/token (3.0–4.7× slower) |
+| Greedy generation | **~100–120 tok/s** | |
+| Prefill 64 / 512 tokens, all logits | 68 / 563 ms | **49 / 222 ms** (1.4–2.5× faster) |
+| Time to first token, 64 / 512 tokens | 55 / 430 ms | **48 / 187 ms** |
+| Peak memory | 600–730 MB | |
+
+On one thread: decode 28.0 vs 36 ms/token (C++ 1.0–1.3× faster), prefill 364 vs 61 ms at T=64
+(HF 6–7× faster). PyTorch on Apple Silicon uses Accelerate BLAS, which runs on the AMX matrix
+coprocessor; plain NEON can't match it on large matmuls. HF's decode barely scales with threads
+because its per-token dispatch overhead dominates.
+
+Correctness, every commit: log-probs within 2e-3 of HF (worst 8.8e-4) and the same argmax at
+all 10,070 positions of 94 prompts up to the full 1024-token context (one allowed near-tie).
+Tokenizer ids match HF on 5,098 cases. Greedy output matches HF `generate` token for token. The
+sampler reproduces HF's temperature/top-k/top-p distributions, and a seed gives identical text
+for any thread count.
+
 ## Status
 
 - [x] Phase 1a: weight export, checkpoint format, `Tensor`, loader, `gpt2 inspect`
@@ -11,7 +35,7 @@ GPT-2 inference in C++17 with no ML-framework dependencies.
 - [x] Phase 4: KV cache
 - [x] Phase 5: blocked / SIMD GEMM (NEON)
 - [x] Phase 6: multithreading (thread pool, 6 performance cores by default)
-- [ ] Phase 7: CLI sampling, benchmarks, results table
+- [x] Phase 7: CLI sampling (temperature, top-k, top-p, seed), `bench`, results table
 
 ## Quick start
 
@@ -35,14 +59,23 @@ python scripts/check_real_weights.py     # every tensor bit-identical to HF
 
 python scripts/make_logits_ref.py         # HF reference for forward_hf (6 prompts, fast)
 python scripts/make_logits_ref.py --prompts tests/diff_prompts.jsonl --rows sampled \
-    --out models/diff_ref.bin             # HF reference for diff_hf (94 prompts, ~9 min now)
-./build/gpt2 generate models "The meaning of life is" 20   # greedy
-./build/gpt2 bench models 64              # time one forward pass
+    --out models/diff_ref.bin             # HF reference for diff_hf (94 prompts)
+python scripts/make_sampler_ref.py        # HF sampling distributions for sampler_hf
+
+./build/gpt2 generate models "The meaning of life is" -n 20          # greedy
+./build/gpt2 generate models "Once upon a time" -n 100 --temperature 0.8 --top-p 0.9 --seed 7
+./build/gpt2 bench models --prompt 64 --gen 32                      # prefill, TTFT, decode, RSS
+python scripts/bench_hf.py --prompt 64 --gen 32 --threads 6         # same numbers for PyTorch
 ```
 
-The `tokenizer`, `forward_hf` and `diff_hf` tests need the generated files in `models/`; they
-are skipped if those are missing. `diff_hf` is labelled `slow`: `ctest -LE slow` skips it (do
-that under ASan, where it would take hours at current speed).
+`generate` is greedy by default. `--temperature T` > 0 samples with HF's defaults (top-k 50,
+top-p 1), applied in HF's order: temperature, top-k, top-p. Without `--seed` a random seed is
+used and printed. Generation stops at `<|endoftext|>` unless `--no-stop` is given. `-` reads the
+prompt from stdin.
+
+The `tokenizer`, `forward_hf`, `forward_threads`, `diff_hf` and `sampler_hf` tests need the
+generated files in `models/`; they are skipped if those are missing. `diff_hf` is labelled
+`slow` (~15 s in Release, ~8 min under ASan): `ctest -LE slow` skips it.
 
 Debug with sanitizers: `cmake -S . -B build-asan -DGPT2_SANITIZE=ON`. On ARM the kernels use
 NEON; `-DGPT2_NO_SIMD=ON` builds the portable scalar path instead (also tested). Race checks:
@@ -60,6 +93,8 @@ scripts/gen_unicode_tables.py   probe HF's pre-tokenizer -> src/unicode_tables.h
 scripts/make_tokenizer_fixtures.py  HF token ids -> tests/tokenizer_cases.tsv
 scripts/make_diff_prompts.py    builds tests/diff_prompts.jsonl (94 prompts, token ids)
 scripts/make_logits_ref.py      HF log-probs -> models/logits_ref.bin, models/diff_ref.bin
+scripts/make_sampler_ref.py     HF warper distributions -> models/sampler_ref.bin
+scripts/bench_hf.py             PyTorch timings with the same definitions as `gpt2 bench`
 src/tensor.h                    non-owning float32 tensor view
 src/model.{h,cpp}               Config, Weights, Model::load
 src/tokenizer.{h,cpp}           byte-level BPE: pre-tokenizer, merges, encode/decode
@@ -67,12 +102,14 @@ src/unicode_tables.h            generated letter/number/space code point ranges
 src/ops.{h,cpp}                 layernorm, matmul, GELU, attention (NEON + scalar fallback)
 src/forward.{h,cpp}             forward pass with KV cache: new tokens -> logits
 src/threadpool.{h,cpp}          persistent pool, dynamic task handout, spin-then-sleep
+src/sampler.{h,cpp}             greedy / temperature / top-k / top-p, HF semantics, seeded
 src/main.cpp                    CLI: inspect, encode, decode, generate, bench
 tests/test_loader.cpp           loader vs reference stats, corrupt-file rejection
 tests/test_tokenizer.cpp        5098 HF-generated cases, invalid UTF-8 round trips, bad files
 tests/test_forward.cpp          tiny-model invariants (causality, KV cache = full pass bit for
                                 bit); 1..10 threads bit-identical; vs HF, prefill and decode
 tests/diff_prompts.jsonl        differential-test prompt set (committed)
+tests/test_sampler.cpp          sampler rules, seeds, draw frequencies; vs HF's warpers
 ```
 
 ## Correctness
@@ -138,11 +175,27 @@ Invalid UTF-8, which HF can't receive, is tokenized byte by byte and decodes bac
 
 ## Benchmarks
 
-Apple M2 Pro (6 performance + 4 efficiency cores), Release build. `gpt2 bench models T`
-prefills T tokens with all logits, then does 32 cached decode steps; best of 3 runs of
-best-of-3. `gpt2 generate` gives greedy generation. This machine is also in normal use, and
+Apple M2 Pro (6 performance + 4 efficiency cores), Release build. `gpt2 bench models
+--prompt T` prefills T tokens with all logits, then does 32 cached decode steps; best of 3 runs
+of best-of-3. `gpt2 generate` gives greedy generation. This machine is also in normal use, and
 run-to-run noise reaches 20–35%. Compare within a table, where rows were measured together;
 across phases, prefer interleaved A/B runs of both builds (as in the phase 6 steps).
+
+Phase 7: C++ vs HF PyTorch 2.14 (CPU, `torch.set_num_threads`), interleaved, best of 2 rounds
+of best-of-3:
+
+| | C++ 1 thread | HF 1 thread | C++ 6 threads | HF 6 threads |
+|---|---|---|---|---|
+| Prefill T=64, all logits | 364 ms | 61 ms | 68 ms | 49 ms |
+| Prefill T=512, all logits | 3012 ms | 437 ms | 563 ms | 222 ms |
+| Time to first token, T=64 / 512 | 279 / 2384 ms | 57 / 361 ms | 55 / 430 ms | 48 / 187 ms |
+| Decode after T=64 | 28.0 ms/token | 35.9 | 8.8 | 41.5 |
+| Decode after T=512 | 28.5 ms/token | 28.9 | 10.0 | 30.6 |
+
+Sampling cost (`generate -n 100`, 6 threads, 3 runs): greedy 102–111 tok/s; temperature +
+top-k 50 is the same (100–111). Top-p without top-k first sorted the whole 50k vocabulary per
+token: 70–78 tok/s. Sorting only the top 1024 when they must contain the cut gives 95–99 tok/s,
+with the same text for the same seed (A/B, 3 pairs).
 
 Phase 6, current code (all rows measured together):
 

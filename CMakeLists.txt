@@ -25,7 +25,7 @@ if(GPT2_SANITIZE)
 endif()
 
 add_library(gpt2core src/model.cpp src/tokenizer.cpp src/ops.cpp src/forward.cpp
-            src/threadpool.cpp)
+            src/threadpool.cpp src/sampler.cpp)
 find_package(Threads REQUIRED)
 target_link_libraries(gpt2core PUBLIC Threads::Threads)
 target_include_directories(gpt2core PUBLIC src)
@@ -96,3 +96,11 @@ add_test(NAME diff_hf
 set_tests_properties(forward_hf forward_threads forward_hf_decode diff_hf PROPERTIES
                      SKIP_RETURN_CODE 77)
 set_tests_properties(diff_hf PROPERTIES LABELS slow TIMEOUT 3600)
+
+# Sampler: unit tests, and the filtered distributions vs HF's warpers on real logits
+# (models/sampler_ref.bin from scripts/make_sampler_ref.py; skipped without it).
+add_executable(test_sampler tests/test_sampler.cpp)
+target_link_libraries(test_sampler gpt2core)
+add_test(NAME sampler_unit COMMAND test_sampler unit)
+add_test(NAME sampler_hf COMMAND test_sampler hf ${CMAKE_SOURCE_DIR}/models/sampler_ref.bin)
+set_tests_properties(sampler_hf PROPERTIES SKIP_RETURN_CODE 77)

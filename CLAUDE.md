@@ -25,7 +25,7 @@ cmake -S . -B build-asan -DGPT2_SANITIZE=ON && cmake --build build-asan -j   # A
 
 cmake -S . -B build-tsan -DGPT2_TSAN=ON && cmake --build build-tsan -j        # races
 (cd build-tsan && ctest -LE slow --output-on-failure)
-GPT2_THREADS=1 ./build/gpt2 bench models 64               # thread count (default: P-cores)
+GPT2_THREADS=1 ./build/gpt2 bench models --prompt 64     # thread count (default: P-cores)
 
 python scripts/export_gpt2.py --model gpt2 --out models   # gpt2.bin, vocab.json, merges.txt
 ./build/gpt2 inspect models/gpt2.bin                      # params: 124439808
@@ -34,8 +34,10 @@ python scripts/make_logits_ref.py                         # models/logits_ref.bi
 python scripts/make_logits_ref.py --prompts tests/diff_prompts.jsonl --rows sampled \
     --out models/diff_ref.bin                             # diff_hf reference
 ./build/gpt2 encode models "text"   |   ./build/gpt2 decode models 15496 995
-./build/gpt2 generate models "prompt" 20                  # greedy
-./build/gpt2 bench models 64                              # prefill T=64 + 32 decode steps
+python scripts/make_sampler_ref.py                        # models/sampler_ref.bin (sampler_hf)
+./build/gpt2 generate models "prompt" -n 20               # greedy; --temperature/--top-k/--top-p/--seed
+./build/gpt2 bench models --prompt 64 --gen 32            # prefill, TTFT, decode, peak RSS
+python scripts/bench_hf.py --prompt 64 --gen 32 --threads 6   # PyTorch, same definitions
 ```
 
 `loader` and `forward_tiny` use a tiny random checkpoint (`scripts/make_tiny_checkpoint.py`).
@@ -65,6 +67,10 @@ python scripts/make_logits_ref.py --prompts tests/diff_prompts.jsonl --rows samp
   atomic counter; workers spin ~100 µs before sleeping. Run TSan after touching it.
 - SIMD: NEON intrinsics under `GPT2_NEON` in `src/ops.cpp`; the scalar path stays as the
   portable fallback (`-DGPT2_NO_SIMD=ON` builds and tests it).
+- Sampler follows HF exactly (temperature -> top-k with boundary ties -> top-p keeping >= 1
+  token). Seeds use std::mt19937_64 and hand-rolled uniform doubles, so text is reproducible
+  across platforms and thread counts. `sampler_hf` allows set differences only at the cut
+  (exact score ties; top-p mass within 1e-6 of 1-p, since HF sums in float32).
 - Tokenizer ground truth is HF's Rust tokenizer, not Python `unicodedata`.
   `src/unicode_tables.h` and `tests/tokenizer_cases.tsv` are generated and committed; regenerate
   with `scripts/gen_unicode_tables.py` / `scripts/make_tokenizer_fixtures.py`, never hand-edit.
@@ -72,7 +78,7 @@ python scripts/make_logits_ref.py --prompts tests/diff_prompts.jsonl --rows samp
 ## The rule for optimizations
 
 Every optimization must (1) keep the differential test passing and (2) be benchmarked before
-and after (`./build/gpt2 bench models [T]`). Record the numbers in the README. The machine is in
+and after (`./build/gpt2 bench models --prompt T`). Record the numbers in the README. The machine is in
 everyday use, so noise reaches 20–35%. Benchmark before/after as an interleaved A/B of both
 binaries in one session, not against numbers from an earlier session.
 
@@ -102,4 +108,9 @@ against a float64 HF run before calling it a regression.
 - [x] 4: KV cache (`KVCache`, `forward(m, cache, tokens, Logits::All|Last)`)
 - [x] 5: blocked / SIMD GEMM: NEON LM head, 4x16 matmul tiles, row kernel, attention
 - [x] 6: multithreading (6 threads: prefill ~4.8x, decode ~2.1x vs 1 thread)
-- [ ] **7: CLI sampling, benchmarks, results table: CURRENT**
+- [x] 7: sampling (HF semantics, seeded), `bench` + `scripts/bench_hf.py`, README results
+
+All planned phases are done. Open directions (ask before starting): prefill is 1.4–2.5x behind
+PyTorch, which uses Accelerate/AMX. Matching it means either using Accelerate (a system framework,
+against the no-external-dependencies rule) or deeper GEMM work (packed weights, larger tiles).
+Other options: larger GPT-2 checkpoints (the exporter already takes --model), quantization.
